@@ -5,20 +5,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 Hidden API key (from Render env)
-const API_KEY = process.env.OPENAI_API_KEY;
+const PORT = process.env.PORT || 10000;
+const GROQ_KEY = process.env.GROQ_API_KEY;
 
-app.post("/api/chat", async (req, res) => {
+// Test route
+app.get("/", (req, res) => {
+  res.send("Codex Backend is running 🚀");
+});
+
+// Chat route
+app.post("/chat", async (req, res) => {
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const { messages } = req.body;
+
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${API_KEY}`,
+        "Authorization": `Bearer ${GROQ_KEY}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        input: req.body.message
+        model: "llama-3.3-70b-versatile",
+        messages,
+        temperature: 0.7,
+        max_tokens: 1200
       })
     });
 
@@ -30,13 +40,6 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// ✅ health check route
-app.get("/", (req, res) => {
-  res.send("Codex AI backend running 🚀");
-});
-
-// ⚠️ IMPORTANT for Render
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
