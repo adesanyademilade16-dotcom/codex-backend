@@ -3,12 +3,6 @@ import cors from "cors";
 
 const app = express();
 
-const PORT = process.env.PORT || 10000;
-
-// ───────────────────────────────────────────────────────────
-// CORS
-// ───────────────────────────────────────────────────────────
-
 const ALLOWED_ORIGINS = [
   "https://adesanyademilade16-dotcom.github.io",
   "http://localhost:3000",
@@ -16,142 +10,68 @@ const ALLOWED_ORIGINS = [
   "http://127.0.0.1:5500"
 ];
 
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
-    }
-  }
-}));
+app.use(cors({ origin: ALLOWED_ORIGINS }));
+app.use(express.json({ limit: "512kb" }));
 
-app.use(express.json({ limit: "1mb" }));
+const PORT = process.env.PORT || 10000;
 
-// ───────────────────────────────────────────────────────────
-// API KEYS
-// ───────────────────────────────────────────────────────────
-
+// ── Groq Keys Rotation ─────────────────────
 const GROQ_KEYS = [
   process.env.GROQ_API_KEY,
   process.env.GROQ_API_KEY_2,
   process.env.GROQ_API_KEY_3
 ].filter(Boolean);
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
 let keyIndex = 0;
 
-function getNextGroqKey() {
+function getGroqKey() {
   if (GROQ_KEYS.length === 0) return null;
-
   const key = GROQ_KEYS[keyIndex];
-
   keyIndex = (keyIndex + 1) % GROQ_KEYS.length;
-
   return key;
 }
 
-// ───────────────────────────────────────────────────────────
-// SIMPLE RATE LIMITER
-// ───────────────────────────────────────────────────────────
+// ── Gemini Key ─────────────────────────────
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const requests = new Map();
-
-function rateLimit(req, res, next) {
-  const ip =
-    req.headers["x-forwarded-for"]?.split(",")[0] ||
-    req.ip;
-
-  const now = Date.now();
-
-  let entry = requests.get(ip);
-
-  if (!entry) {
-    entry = {
-      count: 0,
-      reset: now + 60000
-    };
-  }
-
-  if (now > entry.reset) {
-    entry.count = 0;
-    entry.reset = now + 60000;
-  }
-
-  entry.count++;
-
-  requests.set(ip, entry);
-
-  if (entry.count > 60) {
-    return res.status(429).json({
-      error: "Too many requests. Please wait."
-    });
-  }
-
-  next();
-}
-
-// ───────────────────────────────────────────────────────────
-// HEALTH CHECK
-// ───────────────────────────────────────────────────────────
-
+// Health Check
 app.get("/", (req, res) => {
-  res.json({
-    status: "online",
-    groqKeys: GROQ_KEYS.length,
-    gemini: !!GEMINI_API_KEY
-  });
+  res.send("🚀 Codex Backend v3 - Groq Rotation + Gemini Fallback");
 });
 
-// ───────────────────────────────────────────────────────────
-// CHAT ENDPOINT
-// ───────────────────────────────────────────────────────────
-
-app.post("/chat", rateLimit, async (req, res) => {
+// Main Chat Endpoint
+app.post("/chat", async (req, res) => {
   try {
     const { messages, system } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({
-        error: "messages array required"
-      });
+      return res.status(400).json({ error: "messages array is required" });
     }
+
+    const fullMessages = system 
+      ? [{ role: "system", content: system }, ...messages] 
+      : messages;
 
     let response = null;
 
-    // Try every Groq key
+    // Try Groq with rotation
     for (let i = 0; i < GROQ_KEYS.length; i++) {
-      const groqKey = getNextGroqKey();
+      const groqKey = getGroqKey();
+      console.log(`Trying Groq key \( {i+1}/ \){GROQ_KEYS.length}`);
 
-      console.log(`Trying Groq key ${i + 1}/${GROQ_KEYS.length}`);
-
-      response = await fetch(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${groqKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: "llama-3.1-8b-instant",
-            messages: system
-              ? [
-                  {
-                    role: "system",
-                    content: system
-                  },
-                  ...messages
-                ]
-              : messages,
-            temperature: 0.7,
-            max_tokens: 4096
-          })
-        }
-      );
-
-      console.log("Groq status:", response.status);
+      response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${groqKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "llama-3.1-8b-instant",
+          messages: fullMessages,
+          temperature: 0.65,
+          max_tokens: 2048
+        })
+      });
 
       if (response.ok) {
         const data = await response.json();
@@ -159,76 +79,36 @@ app.post("/chat", rateLimit, async (req, res) => {
       }
     }
 
-    // Gemini fallback
+    // Gemini Fallback
     if (GEMINI_API_KEY) {
-      console.log("All Groq keys failed. Using Gemini...");
-
-      const geminiResponse = await fetch(
+      console.log("All Groq keys failed → Using Gemini fallback");
+      response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: messages
-                      .map(m => `${m.role}: ${m.content}`)
-                      .join("\n\n")
-                  }
-                ]
-              }
-            ]
+            contents: [{ parts: [{ text: fullMessages.map(m => m.content).join("\n\n") }] }]
           })
         }
       );
 
-      if (!geminiResponse.ok) {
-        const err = await geminiResponse.text();
-
-        console.error("Gemini error:", err);
-
-        return res.status(500).json({
-          error: "All AI providers failed."
+      if (response.ok) {
+        const geminiData = await response.json();
+        const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
+        return res.json({
+          choices: [{ message: { content: text } }]
         });
       }
-
-      const geminiData = await geminiResponse.json();
-
-      const text =
-        geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        "No response generated.";
-
-      return res.json({
-        choices: [
-          {
-            message: {
-              content: text
-            }
-          }
-        ]
-      });
     }
 
-    return res.status(500).json({
-      error: "No available AI provider."
-    });
+    return res.status(500).json({ error: "All AI providers are currently unavailable. Please try again later." });
 
   } catch (error) {
-    console.error("SERVER ERROR:", error);
-
-    res.status(500).json({
-      error: "Internal server error"
-    });
+    console.error("Backend error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// ───────────────────────────────────────────────────────────
-// START SERVER
-// ───────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`✅ Codex Backend running on port ${PORT}`);
