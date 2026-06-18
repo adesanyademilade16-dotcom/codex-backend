@@ -3,11 +3,16 @@ import cors from "cors";
 
 const app = express();
 
-// ── CORS: only accept requests from your GitHub Pages domain ──────────────
+const PORT = process.env.PORT || 10000;
+
+// ───────────────────────────────────────────────────────────
+// CORS
+// ───────────────────────────────────────────────────────────
+
 const ALLOWED_ORIGINS = [
   "https://adesanyademilade16-dotcom.github.io",
   "http://localhost:3000",
-  "http://localhost:8080", 
+  "http://localhost:8080",
   "http://127.0.0.1:5500"
 ];
 
@@ -21,101 +26,212 @@ app.use(cors({
   }
 }));
 
-app.use(express.json({ limit: "512kb" }));
+app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 10000;
-const GROQ_KEY = process.env.GROQ_API_KEY;
+// ───────────────────────────────────────────────────────────
+// API KEYS
+// ───────────────────────────────────────────────────────────
 
-// ── Rate Limiter (per IP) ───────────────────────────────────────────────
-const rateLimitMap = new Map();
-const RATE_WINDOW_MS = 60 * 1000; 
-const RATE_MAX_REQUESTS = 30;     // Increased a bit
+const GROQ_KEYS = [
+  process.env.GROQ_API_KEY,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3
+].filter(Boolean);
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+let keyIndex = 0;
+
+function getNextGroqKey() {
+  if (GROQ_KEYS.length === 0) return null;
+
+  const key = GROQ_KEYS[keyIndex];
+
+  keyIndex = (keyIndex + 1) % GROQ_KEYS.length;
+
+  return key;
+}
+
+// ───────────────────────────────────────────────────────────
+// SIMPLE RATE LIMITER
+// ───────────────────────────────────────────────────────────
+
+const requests = new Map();
 
 function rateLimit(req, res, next) {
-  const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip;
-  const now = Date.now();
-  const entry = rateLimitMap.get(ip) || { count: 0, resetAt: now + RATE_WINDOW_MS };
+  const ip =
+    req.headers["x-forwarded-for"]?.split(",")[0] ||
+    req.ip;
 
-  if (now > entry.resetAt) {
+  const now = Date.now();
+
+  let entry = requests.get(ip);
+
+  if (!entry) {
+    entry = {
+      count: 0,
+      reset: now + 60000
+    };
+  }
+
+  if (now > entry.reset) {
     entry.count = 0;
-    entry.resetAt = now + RATE_WINDOW_MS;
+    entry.reset = now + 60000;
   }
 
   entry.count++;
-  rateLimitMap.set(ip, entry);
 
-  if (entry.count > RATE_MAX_REQUESTS) {
+  requests.set(ip, entry);
+
+  if (entry.count > 60) {
     return res.status(429).json({
-      error: "Too many requests. Please wait a moment before trying again."
+      error: "Too many requests. Please wait."
     });
   }
+
   next();
 }
 
-// ── Health check ──────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────
+// HEALTH CHECK
+// ───────────────────────────────────────────────────────────
+
 app.get("/", (req, res) => {
-  res.send("🚀 Codex Backend is running - Powered by Groq + Llama 3.1 8B");
+  res.json({
+    status: "online",
+    groqKeys: GROQ_KEYS.length,
+    gemini: !!GEMINI_API_KEY
+  });
 });
 
-// ── Main Chat Route (Upgraded) ────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────
+// CHAT ENDPOINT
+// ───────────────────────────────────────────────────────────
+
 app.post("/chat", rateLimit, async (req, res) => {
   try {
-    const { messages, mode } = req.body;   // Accept mode from frontend if sent
+    const { messages, system } = req.body;
 
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: "messages array is required" });
-    }
-    if (messages.length > 30) {
-      return res.status(400).json({ error: "Too many messages in context" });
-    }
-
-    if (!GROQ_KEY) {
-      console.error("GROQ_API_KEY not set");
-      return res.status(500).json({ error: "Server configuration error" });
-    }
-
-    // ── Powerful model settings for education + large outputs ─────────────
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${GROQ_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "llama-3.1-8b-instant",           // ← Switched to higher limit model
-        messages,
-        temperature: 0.65,                       // Good balance for education
-        max_tokens: 2048,                        // Increased for longer responses (30+ questions)
-        top_p: 0.9,
-        presence_penalty: 0.1,
-        frequency_penalty: 0.1
-      })
-    });
-
-    if (!response.ok) {
-      const errData = await response.json().catch(() => ({}));
-      const msg = errData?.error?.message || `Groq error (${response.status})`;
-      console.error("Groq API error:", msg);
-      
-      return res.status(response.status).json({ 
-        error: msg,
-        suggestion: "Try again in a few minutes or use a shorter question."
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({
+        error: "messages array required"
       });
     }
 
-    const data = await response.json();
-    res.json(data);
+    let response = null;
+
+    // Try every Groq key
+    for (let i = 0; i < GROQ_KEYS.length; i++) {
+      const groqKey = getNextGroqKey();
+
+      console.log(`Trying Groq key ${i + 1}/${GROQ_KEYS.length}`);
+
+      response = await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${groqKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: "llama-3.1-8b-instant",
+            messages: system
+              ? [
+                  {
+                    role: "system",
+                    content: system
+                  },
+                  ...messages
+                ]
+              : messages,
+            temperature: 0.7,
+            max_tokens: 4096
+          })
+        }
+      );
+
+      console.log("Groq status:", response.status);
+
+      if (response.ok) {
+        const data = await response.json();
+        return res.json(data);
+      }
+    }
+
+    // Gemini fallback
+    if (GEMINI_API_KEY) {
+      console.log("All Groq keys failed. Using Gemini...");
+
+      const geminiResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: messages
+                      .map(m => `${m.role}: ${m.content}`)
+                      .join("\n\n")
+                  }
+                ]
+              }
+            ]
+          })
+        }
+      );
+
+      if (!geminiResponse.ok) {
+        const err = await geminiResponse.text();
+
+        console.error("Gemini error:", err);
+
+        return res.status(500).json({
+          error: "All AI providers failed."
+        });
+      }
+
+      const geminiData = await geminiResponse.json();
+
+      const text =
+        geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ||
+        "No response generated.";
+
+      return res.json({
+        choices: [
+          {
+            message: {
+              content: text
+            }
+          }
+        ]
+      });
+    }
+
+    return res.status(500).json({
+      error: "No available AI provider."
+    });
 
   } catch (error) {
-    console.error("Chat handler error:", error.message);
-    res.status(500).json({ 
-      error: "Internal server error. Please try again.",
-      suggestion: "Check your internet connection."
+    console.error("SERVER ERROR:", error);
+
+    res.status(500).json({
+      error: "Internal server error"
     });
   }
 });
 
+// ───────────────────────────────────────────────────────────
+// START SERVER
+// ───────────────────────────────────────────────────────────
+
 app.listen(PORT, () => {
   console.log(`✅ Codex Backend running on port ${PORT}`);
-  console.log(`📌 Using model: llama-3.1-8b-instant (Higher free limits)`);
+  console.log(`📌 Groq keys loaded: ${GROQ_KEYS.length}`);
+  console.log(`📌 Gemini enabled: ${!!GEMINI_API_KEY}`);
 });
