@@ -27,120 +27,97 @@ app.use(cors({
 }));
 
 // ─────────────────────────────
-// KEYS
+// KEYS (2 GROQ ACCOUNTS NOW)
 // ─────────────────────────────
-const GROQ_KEY = process.env.GROQ_API_KEY;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GROQ_KEYS = [
+  process.env.GROQ_API_KEY,
+  process.env.GROQ_API_KEY_2
+].filter(Boolean);
 
-// ─────────────────────────────
-// SIMPLE IN-MEMORY CACHE (IMPORTANT)
-// ─────────────────────────────
-const cache = new Map();
-
-function getCacheKey(messages) {
-  return JSON.stringify(messages).slice(0, 300);
-}
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // ─────────────────────────────
-// RATE LIMIT (SMART)
-// ─────────────────────────────
-const rateMap = new Map();
-
-function rateLimit(req, res, next) {
-  const ip = req.ip;
-  const now = Date.now();
-
-  const user = rateMap.get(ip) || { count: 0, time: now };
-
-  if (now - user.time > 60000) {
-    user.count = 0;
-    user.time = now;
-  }
-
-  user.count++;
-
-  rateMap.set(ip, user);
-
-  if (user.count > 30) {
-    return res.status(429).json({
-      error: "Too many requests. Slow down."
-    });
-  }
-
-  next();
-}
-
-// ─────────────────────────────
-// HEALTH
+// HEALTH CHECK
 // ─────────────────────────────
 app.get("/", (req, res) => {
   res.json({
-    status: "PRO AI ONLINE",
-    groq: !!GROQ_KEY,
-    gemini: !!GEMINI_KEY
+    status: "ONLINE",
+    groq_keys: GROQ_KEYS.length,
+    gemini: !!GEMINI_API_KEY
   });
 });
 
 // ─────────────────────────────
-// MAIN CHAT
+// CHAT ENDPOINT
 // ─────────────────────────────
-app.post("/chat", rateLimit, async (req, res) => {
+app.post("/chat", async (req, res) => {
   try {
     const { messages, system } = req.body;
 
-    if (!messages) {
+    if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: "messages required" });
-    }
-
-    const cacheKey = getCacheKey(messages);
-
-    // ── CACHE HIT ──
-    if (cache.has(cacheKey)) {
-      return res.json(cache.get(cacheKey));
     }
 
     const fullMessages = system
       ? [{ role: "system", content: system }, ...messages]
       : messages;
 
-    let response;
+    let lastError = null;
 
     // ─────────────────────────────
-    // GROQ FIRST
+    // GROQ ROTATION (CLEAN + SAFE)
     // ─────────────────────────────
-    try {
-      response = await fetch(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${GROQ_KEY}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: "llama-3.1-8b-instant",
-            messages: fullMessages,
-            temperature: 0.7,
-            max_tokens: 4096
-          })
+    for (let i = 0; i < GROQ_KEYS.length; i++) {
+      const key = GROQ_KEYS[i];
+
+      console.log(`Trying Groq key ${i + 1}/${GROQ_KEYS.length}`);
+
+      try {
+        const response = await fetch(
+          "https://api.groq.com/openai/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${key}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model: "llama-3.1-8b-instant",
+              messages: fullMessages,
+              temperature: 0.7,
+              max_tokens: 4096
+            })
+          }
+        );
+
+        console.log("Groq status:", response.status);
+
+        if (response.ok) {
+          const data = await response.json();
+          return res.json(data);
         }
-      );
 
-      if (response.ok) {
-        const data = await response.json();
-        cache.set(cacheKey, data);
-        return res.json(data);
+        if (response.status !== 429) {
+          const err = await response.text();
+          console.log("Groq hard error:", err);
+          lastError = err;
+          break;
+        }
+
+      } catch (err) {
+        console.log("Groq request failed:", err.message);
+        lastError = err.message;
       }
-    } catch (e) {
-      console.log("Groq failed:", e.message);
     }
 
     // ─────────────────────────────
-    // GEMINI FALLBACK
+    // GEMINI FALLBACK (FIXED MODEL)
     // ─────────────────────────────
-    if (GEMINI_KEY) {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${GEMINI_KEY}`,
+    if (GEMINI_API_KEY) {
+      console.log("Using Gemini fallback...");
+
+      const geminiResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: "POST",
           headers: {
@@ -152,7 +129,7 @@ app.post("/chat", rateLimit, async (req, res) => {
                 parts: [
                   {
                     text: fullMessages
-                      .map(m => m.content)
+                      .map(m => `${m.role}: ${m.content}`)
                       .join("\n\n")
                   }
                 ]
@@ -162,14 +139,14 @@ app.post("/chat", rateLimit, async (req, res) => {
         }
       );
 
-      if (response.ok) {
-        const data = await response.json();
+      if (geminiResponse.ok) {
+        const data = await geminiResponse.json();
 
         const text =
           data?.candidates?.[0]?.content?.parts?.[0]?.text ||
           "No response";
 
-        const output = {
+        return res.json({
           choices: [
             {
               message: {
@@ -177,34 +154,36 @@ app.post("/chat", rateLimit, async (req, res) => {
               }
             }
           ]
-        };
-
-        cache.set(cacheKey, output);
-        return res.json(output);
+        });
       }
+
+      const err = await geminiResponse.text();
+      console.log("Gemini error:", err);
     }
 
     // ─────────────────────────────
-    // SAFE FAIL (NO 500 CRASH)
+    // FINAL SAFE RESPONSE (NO 500 CRASH)
     // ─────────────────────────────
     return res.json({
       choices: [
         {
           message: {
-            content: "AI is busy right now. Try again in a moment."
+            content:
+              "AI is currently busy. Please try again in a moment."
           }
         }
-      ]
+      ],
+      debug: lastError
     });
 
-  } catch (err) {
-    console.error(err);
+  } catch (error) {
+    console.error("SERVER ERROR:", error);
 
     return res.json({
       choices: [
         {
           message: {
-            content: "Server error but AI is recovering."
+            content: "Server error but AI is still running."
           }
         }
       ]
@@ -213,10 +192,10 @@ app.post("/chat", rateLimit, async (req, res) => {
 });
 
 // ─────────────────────────────
-// START
+// START SERVER
 // ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🚀 PRO AI Backend running on ${PORT}`);
-  console.log(`📌 Groq active: ${!!GROQ_KEY}`);
-  console.log(`📌 Gemini active: ${!!GEMINI_KEY}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📌 Groq accounts: ${GROQ_KEYS.length}`);
+  console.log(`📌 Gemini enabled: ${!!GEMINI_API_KEY}`);
 });
