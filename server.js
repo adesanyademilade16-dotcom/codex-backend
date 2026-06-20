@@ -38,6 +38,9 @@ const GROQ_KEYS = [
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-2.5-flash";
 
+const CEREBRAS_KEY = process.env.CEREBRAS_API_KEY;
+const CEREBRAS_MODEL = "llama-3.3-70b"; // fast + large context
+
 // Groq llama-3.1-8b-instant has ~8000 token context window.
 // ~1 token ≈ 4 chars, so we cap system+messages at ~24 000 chars to stay safe.
 const GROQ_MAX_CHARS = 24000;
@@ -48,13 +51,11 @@ function truncateForGroq(messages) {
   let total = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   if (total <= GROQ_MAX_CHARS) return messages;
 
-  // Truncate system message first (it usually holds the big PDF context)
   return messages.map(m => {
     if (m.role === "system" && m.content.length > 8000) {
       const trimmed = m.content.slice(0, 8000);
       return { ...m, content: trimmed + "\n\n[...document truncated for model context limit...]" };
     }
-    // Also trim oversized user messages
     if (m.role === "user" && m.content.length > 6000) {
       const trimmed = m.content.slice(0, 6000);
       return { ...m, content: trimmed + "\n\n[...truncated...]" };
@@ -71,7 +72,9 @@ app.get("/", (req, res) => {
     status: "ONLINE",
     groq_keys: GROQ_KEYS.length,
     gemini: !!GEMINI_KEY,
-    gemini_model: GEMINI_MODEL
+    gemini_model: GEMINI_MODEL,
+    cerebras: !!CEREBRAS_KEY,
+    cerebras_model: CEREBRAS_MODEL
   });
 });
 
@@ -125,7 +128,30 @@ async function callGemini(fullMessages) {
 }
 
 // ─────────────────────────────
+// CEREBRAS CALL
+// Cerebras uses the OpenAI-compatible API format.
+// llama-3.3-70b has a large context window (~128k tokens)
+// so no truncation needed — great for big PDF contexts.
+// ─────────────────────────────
+async function callCerebras(fullMessages) {
+  return fetch("https://api.cerebras.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CEREBRAS_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: CEREBRAS_MODEL,
+      messages: fullMessages,
+      temperature: 0.7,
+      max_tokens: 4096
+    })
+  });
+}
+
+// ─────────────────────────────
 // MAIN CHAT ENDPOINT
+// Fallback chain: Groq → Gemini → Cerebras
 // ─────────────────────────────
 app.post("/chat", async (req, res) => {
   try {
@@ -157,18 +183,16 @@ app.post("/chat", async (req, res) => {
 
         if (response.status === 429) {
           lastError = "groq_429";
-          continue; // try next key
+          continue;
         }
 
         if (response.status === 413) {
-          // Payload too large even after truncation — skip Groq entirely, go Gemini
-          console.log("Groq 413 — payload too large even after trim, using Gemini");
+          console.log("Groq 413 — payload too large even after trim, skipping to fallbacks");
           lastError = "groq_413";
           allGroqRateLimited = false;
           break;
         }
 
-        // Other hard error
         lastError = await response.text();
         allGroqRateLimited = false;
         break;
@@ -191,7 +215,7 @@ app.post("/chat", async (req, res) => {
             const data = await response.json();
             return res.json(data);
           }
-          if (response.status === 413) break; // go to Gemini
+          if (response.status === 413) break;
         } catch (_) { /* fall through */ }
       }
     }
@@ -207,17 +231,47 @@ app.post("/chat", async (req, res) => {
           const text =
             data?.candidates?.[0]?.content?.parts?.[0]?.text ||
             "No response";
-
           return res.json({
             choices: [{ message: { content: text } }]
           });
         }
 
+        const geminiStatus = geminiResponse.status;
         const err = await geminiResponse.text();
         console.log("Gemini error:", err);
         lastError = err;
+
+        // Only fall through to Cerebras on quota/rate errors
+        if (geminiStatus !== 429 && geminiStatus !== 503) {
+          // Hard Gemini error (bad key, invalid request etc) — still try Cerebras
+          console.log(`Gemini hard error ${geminiStatus} — trying Cerebras`);
+        }
       } catch (err) {
         console.log("Gemini request failed:", err.message);
+        lastError = err.message;
+      }
+    }
+
+    // ── CEREBRAS FALLBACK ──
+    if (CEREBRAS_KEY) {
+      console.log("Using Cerebras fallback:", CEREBRAS_MODEL);
+      try {
+        const cerebrasResponse = await callCerebras(fullMessages);
+        console.log("Cerebras status:", cerebrasResponse.status);
+
+        if (cerebrasResponse.ok) {
+          const data = await cerebrasResponse.json();
+          const text = data?.choices?.[0]?.message?.content || "No response";
+          return res.json({
+            choices: [{ message: { content: text } }]
+          });
+        }
+
+        const err = await cerebrasResponse.text();
+        console.log("Cerebras error:", err);
+        lastError = err;
+      } catch (err) {
+        console.log("Cerebras request failed:", err.message);
         lastError = err.message;
       }
     }
@@ -251,4 +305,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📌 Groq keys: ${GROQ_KEYS.length}`);
   console.log(`📌 Gemini enabled: ${!!GEMINI_KEY} (${GEMINI_MODEL})`);
+  console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} (${CEREBRAS_MODEL})`);
 });
