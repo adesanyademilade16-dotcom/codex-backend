@@ -32,17 +32,40 @@ const GROQ_KEYS = [
   process.env.GROQ_API_KEY_3
 ].filter(Boolean);
 
-const GEMINI_KEY      = process.env.GEMINI_API_KEY;
-// Try 2.0-flash first (higher free quota), then 2.5-flash as backup
-const GEMINI_MODELS   = ["gemini-2.0-flash", "gemini-2.5-flash"];
+// Two Gemini keys — key 1 tried first, key 2 as backup
+const GEMINI_KEYS   = [
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_API_KEY_2
+].filter(Boolean);
+// Try gemini-2.0-flash first (highest free quota), then 2.5-flash
+const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
 
+// OpenRouter — OpenAI-compatible, free ":free" models, 20 RPM
+// Best free models as of June 2026 (large context, high quality)
+const OPENROUTER_KEY    = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODELS = [
+  "meta-llama/llama-3.3-70b-instruct:free",   // 128k ctx, fast & reliable
+  "deepseek/deepseek-r1:free",                  // 164k ctx, strong reasoning
+  "qwen/qwen3-coder:free"                       // 1M ctx, excellent general use
+];
+
+// Mistral — free "Experiment" plan (~1B tokens/month, no card needed)
+// mistral-small-latest = Mistral Small 4 (256k context)
+const MISTRAL_KEY   = process.env.MISTRAL_API_KEY;
+const MISTRAL_MODEL = "mistral-small-latest";  // 256k context, OpenAI-compatible
+
+// Cerebras — ultra-fast inference (~3000 tokens/s on WSE hardware)
+// llama-3.3-70b was DEPRECATED Feb 2026. Current models as of June 2026:
+//   gpt-oss-120b  → production, 120B MoE, ~3000 t/s, 128k ctx
+//   zai-glm-4.7   → preview,    355B,     ~1000 t/s, 128k ctx (fallback)
 const CEREBRAS_KEY    = process.env.CEREBRAS_API_KEY;
-const CEREBRAS_MODEL  = "llama-3.3-70b";  // correct name for Cerebras API
+const CEREBRAS_MODELS = ["gpt-oss-120b", "zai-glm-4.7"];
 
-const DEEPSEEK_KEY    = process.env.DEEPSEEK_API_KEY;
-const DEEPSEEK_MODEL  = "deepseek-chat";
+// DeepSeek — 64k context, last-resort fallback
+const DEEPSEEK_KEY   = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_MODEL = "deepseek-chat";
 
-const GROQ_MAX_CHARS  = 24000;
+const GROQ_MAX_CHARS = 24000;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -65,10 +88,14 @@ app.get("/", (req, res) => {
   res.json({
     status: "ONLINE",
     groq_keys: GROQ_KEYS.length,
-    gemini: !!GEMINI_KEY,
+    gemini_keys: GEMINI_KEYS.length,
     gemini_models: GEMINI_MODELS,
+    openrouter: !!OPENROUTER_KEY,
+    openrouter_models: OPENROUTER_MODELS,
+    mistral: !!MISTRAL_KEY,
+    mistral_model: MISTRAL_MODEL,
     cerebras: !!CEREBRAS_KEY,
-    cerebras_model: CEREBRAS_MODEL,
+    cerebras_models: CEREBRAS_MODELS,
     deepseek: !!DEEPSEEK_KEY,
     deepseek_model: DEEPSEEK_MODEL
   });
@@ -93,8 +120,8 @@ async function callGroq(key, fullMessages) {
 
 // ─────────────────────────────
 // GEMINI CALL
-// Tries each model in GEMINI_MODELS until one works.
-// gemini-2.0-flash has a much higher free quota than 2.5-flash.
+// Cycles through both API keys × both models (4 combos total).
+// gemini-2.0-flash has the highest free quota.
 // ─────────────────────────────
 async function callGemini(fullMessages) {
   const systemMsg = fullMessages.find(m => m.role === "system");
@@ -110,47 +137,97 @@ async function callGemini(fullMessages) {
   };
   if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg.content }] };
 
-  // Try each Gemini model in order
-  for (const model of GEMINI_MODELS) {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-    );
+  // Try every key × every model combination until one works
+  for (const key of GEMINI_KEYS) {
+    for (const model of GEMINI_MODELS) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      );
 
-    if (response.ok) {
-      console.log(`Gemini success with model: ${model}`);
+      if (response.ok) {
+        console.log(`Gemini success — key index ${GEMINI_KEYS.indexOf(key) + 1}, model: ${model}`);
+        return response;
+      }
+
+      const status = response.status;
+      if (status === 429 || status === 503) {
+        const errText = await response.text();
+        console.log(`Gemini key${GEMINI_KEYS.indexOf(key) + 1}/${model} rate-limited (${status}), trying next combo...`);
+        // If this is the very last combo, return the error response
+        if (key === GEMINI_KEYS[GEMINI_KEYS.length - 1] && model === GEMINI_MODELS[GEMINI_MODELS.length - 1]) {
+          return new Response(errText, { status });
+        }
+        continue;
+      }
+
+      // Hard error — return as-is
       return response;
     }
-
-    const status = response.status;
-    // Only skip to next model on quota/rate errors
-    if (status === 429 || status === 503) {
-      const errText = await response.text();
-      console.log(`Gemini ${model} quota/rate error (${status}), trying next model...`);
-      // If this was the last model, return the failed response
-      if (model === GEMINI_MODELS[GEMINI_MODELS.length - 1]) {
-        // Return a fake Response with the error so caller can log it
-        return new Response(errText, { status });
-      }
-      continue;
-    }
-
-    // Hard error on this model — return it as-is
-    return response;
   }
 }
 
 // ─────────────────────────────
-// CEREBRAS CALL
-// OpenAI-compatible. Large context window (~128k tokens).
-// Correct model name: "llama-3.3-70b" (NOT "llama3.3-70b")
+// OPENROUTER CALL
+// OpenAI-compatible. Tries each free model in turn.
+// Free tier: 20 RPM, no daily hard cap on tokens.
+// Model IDs use ":free" suffix — $0/M tokens.
 // ─────────────────────────────
-async function callCerebras(fullMessages) {
-  return fetch("https://api.cerebras.ai/v1/chat/completions", {
+async function callOpenRouter(fullMessages) {
+  for (const model of OPENROUTER_MODELS) {
+    try {
+      console.log(`Trying OpenRouter model: ${model}`);
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://adesanyademilade16-dotcom.github.io",
+          "X-Title": "Codex Study Hub"
+        },
+        body: JSON.stringify({
+          model,
+          messages: fullMessages,
+          temperature: 0.7,
+          max_tokens: 4096
+        })
+      });
+
+      if (response.ok) {
+        console.log(`OpenRouter success: ${model}`);
+        return { response, model };
+      }
+
+      const status = response.status;
+      const errText = await response.text();
+      console.log(`OpenRouter ${model} failed (${status}): ${errText.slice(0, 120)}`);
+
+      // 429 / 503 → try next model; any other error → bail out
+      if (status !== 429 && status !== 503) {
+        return { response: new Response(errText, { status }), model };
+      }
+    } catch (err) {
+      console.log(`OpenRouter ${model} threw: ${err.message}`);
+    }
+  }
+  return null; // all models failed
+}
+
+// ─────────────────────────────
+// MISTRAL CALL
+// OpenAI-compatible endpoint.
+// mistral-small-latest → Mistral Small 4 (256k context, free Experiment plan).
+// ~1B tokens/month free, 1 RPS rate limit.
+// ─────────────────────────────
+async function callMistral(fullMessages) {
+  return fetch("https://api.mistral.ai/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${CEREBRAS_KEY}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${MISTRAL_KEY}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify({
-      model: CEREBRAS_MODEL,
+      model: MISTRAL_MODEL,
       messages: fullMessages,
       temperature: 0.7,
       max_tokens: 4096
@@ -159,8 +236,42 @@ async function callCerebras(fullMessages) {
 }
 
 // ─────────────────────────────
+// CEREBRAS CALL
+// Tries gpt-oss-120b (production, ~3000 t/s) first,
+// then zai-glm-4.7 (preview, 355B) as secondary.
+// llama-3.3-70b was deprecated Feb 2026.
+// ─────────────────────────────
+async function callCerebras(fullMessages) {
+  for (const model of CEREBRAS_MODELS) {
+    try {
+      console.log(`Trying Cerebras model: ${model}`);
+      const response = await fetch("https://api.cerebras.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${CEREBRAS_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: fullMessages,
+          temperature: 0.7,
+          max_tokens: 4096
+        })
+      });
+      if (response.ok) {
+        console.log(`Cerebras success: ${model}`);
+        return response;
+      }
+      const status = response.status;
+      const errText = await response.text();
+      console.log(`Cerebras ${model} failed (${status}): ${errText.slice(0, 120)}`);
+      if (status !== 429 && status !== 503) return new Response(errText, { status });
+    } catch (err) {
+      console.log(`Cerebras ${model} threw: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────
 // DEEPSEEK CALL
-// OpenAI-compatible. 64k context window.
 // ─────────────────────────────
 async function callDeepSeek(fullMessages) {
   return fetch("https://api.deepseek.com/chat/completions", {
@@ -177,7 +288,14 @@ async function callDeepSeek(fullMessages) {
 
 // ─────────────────────────────
 // MAIN CHAT ENDPOINT
-// Fallback chain: Groq → Gemini (2.0→2.5) → Cerebras → DeepSeek
+//
+// Fallback chain (in order):
+//   1. Groq (3 keys × retry after 4s if all 429)
+//   2. Gemini (2 keys × 2 models = 4 combos)
+//   3. OpenRouter (3 free models: Llama 3.3 70B → DeepSeek R1 → Qwen3 Coder)
+//   4. Mistral (mistral-small-latest, 256k context)
+//   5. Cerebras (gpt-oss-120b → zai-glm-4.7)
+//   6. DeepSeek (deepseek-chat)
 // ─────────────────────────────
 app.post("/chat", async (req, res) => {
   try {
@@ -216,42 +334,79 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // ── PASS 2: all rate-limited → wait, retry ──
+    // ── PASS 2: all rate-limited → wait 4s, retry Groq ──
     if (allGroqRateLimited && GROQ_KEYS.length > 0) {
-      console.log("All Groq keys rate-limited — waiting 4s");
+      console.log("All Groq keys rate-limited — waiting 4s then retrying");
       await sleep(4000);
       for (let i = 0; i < GROQ_KEYS.length; i++) {
         try {
           const response = await callGroq(GROQ_KEYS[i], fullMessages);
-          console.log(`Retry pass key ${i + 1} status:`, response.status);
+          console.log(`Groq retry key ${i + 1} status:`, response.status);
           if (response.ok) return res.json(await response.json());
           if (response.status === 413) break;
         } catch (_) { /* fall through */ }
       }
     }
 
-    // ── GEMINI FALLBACK (tries 2.0-flash then 2.5-flash) ──
-    if (GEMINI_KEY) {
+    // ── GEMINI FALLBACK (2 keys × 2 models) ──
+    if (GEMINI_KEYS.length > 0) {
       console.log("Trying Gemini fallback...");
       try {
         const geminiResponse = await callGemini(fullMessages);
-        if (geminiResponse.ok) {
+        if (geminiResponse && geminiResponse.ok) {
           const data = await geminiResponse.json();
           const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
           return res.json({ choices: [{ message: { content: text } }] });
         }
-        const err = await geminiResponse.text().catch(() => "unknown error");
-        console.log("All Gemini models failed:", err);
+        const err = await geminiResponse?.text().catch(() => "unknown");
+        console.log("All Gemini combos failed:", err?.slice(0, 120));
         lastError = err;
       } catch (err) {
-        console.log("Gemini request failed:", err.message);
+        console.log("Gemini threw:", err.message);
+        lastError = err.message;
+      }
+    }
+
+    // ── OPENROUTER FALLBACK (3 free models) ──
+    if (OPENROUTER_KEY) {
+      console.log("Trying OpenRouter fallback...");
+      try {
+        const result = await callOpenRouter(fullMessages);
+        if (result && result.response.ok) {
+          const data = await result.response.json();
+          const text = data?.choices?.[0]?.message?.content || "No response";
+          return res.json({ choices: [{ message: { content: text } }] });
+        }
+        lastError = `openrouter_all_failed`;
+      } catch (err) {
+        console.log("OpenRouter threw:", err.message);
+        lastError = err.message;
+      }
+    }
+
+    // ── MISTRAL FALLBACK (mistral-small-latest, 256k ctx) ──
+    if (MISTRAL_KEY) {
+      console.log("Trying Mistral fallback:", MISTRAL_MODEL);
+      try {
+        const mistralResponse = await callMistral(fullMessages);
+        console.log("Mistral status:", mistralResponse.status);
+        if (mistralResponse.ok) {
+          const data = await mistralResponse.json();
+          const text = data?.choices?.[0]?.message?.content || "No response";
+          return res.json({ choices: [{ message: { content: text } }] });
+        }
+        const err = await mistralResponse.text();
+        console.log("Mistral error:", err.slice(0, 120));
+        lastError = err;
+      } catch (err) {
+        console.log("Mistral threw:", err.message);
         lastError = err.message;
       }
     }
 
     // ── CEREBRAS FALLBACK ──
     if (CEREBRAS_KEY) {
-      console.log("Using Cerebras fallback:", CEREBRAS_MODEL);
+      console.log("Trying Cerebras fallback (models:", CEREBRAS_MODELS.join(", "), ")");
       try {
         const cerebrasResponse = await callCerebras(fullMessages);
         console.log("Cerebras status:", cerebrasResponse.status);
@@ -261,17 +416,17 @@ app.post("/chat", async (req, res) => {
           return res.json({ choices: [{ message: { content: text } }] });
         }
         const err = await cerebrasResponse.text();
-        console.log("Cerebras error:", err);
+        console.log("Cerebras error:", err.slice(0, 120));
         lastError = err;
       } catch (err) {
-        console.log("Cerebras request failed:", err.message);
+        console.log("Cerebras threw:", err.message);
         lastError = err.message;
       }
     }
 
     // ── DEEPSEEK FALLBACK ──
     if (DEEPSEEK_KEY) {
-      console.log("Using DeepSeek fallback:", DEEPSEEK_MODEL);
+      console.log("Trying DeepSeek fallback:", DEEPSEEK_MODEL);
       try {
         const deepseekResponse = await callDeepSeek(fullMessages);
         console.log("DeepSeek status:", deepseekResponse.status);
@@ -281,15 +436,15 @@ app.post("/chat", async (req, res) => {
           return res.json({ choices: [{ message: { content: text } }] });
         }
         const err = await deepseekResponse.text();
-        console.log("DeepSeek error:", err);
+        console.log("DeepSeek error:", err.slice(0, 120));
         lastError = err;
       } catch (err) {
-        console.log("DeepSeek request failed:", err.message);
+        console.log("DeepSeek threw:", err.message);
         lastError = err.message;
       }
     }
 
-    // ── FINAL SAFE RESPONSE ──
+    // ── ALL PROVIDERS EXHAUSTED ──
     return res.json({
       choices: [{ message: { content: "AI is currently busy. Please try again in a moment." } }],
       debug: lastError
@@ -309,8 +464,9 @@ app.post("/chat", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📌 Groq keys: ${GROQ_KEYS.length}`);
-  console.log(`📌 Gemini enabled: ${!!GEMINI_KEY} (${GEMINI_MODELS.join(" → ")})`);
-  console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} (${CEREBRAS_MODEL})`);
-  console.log(`📌 DeepSeek enabled: ${!!DEEPSEEK_KEY} (${DEEPSEEK_MODEL})`);
+  console.log(`📌 Gemini keys: ${GEMINI_KEYS.length} — models: ${GEMINI_MODELS.join(" → ")}`);
+  console.log(`📌 OpenRouter enabled: ${!!OPENROUTER_KEY} — models: ${OPENROUTER_MODELS.join(", ")}`);
+  console.log(`📌 Mistral enabled: ${!!MISTRAL_KEY} — model: ${MISTRAL_MODEL} (256k ctx)`);
+  console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} — models: ${CEREBRAS_MODELS.join(" → ")}`);
+  console.log(`📌 DeepSeek enabled: ${!!DEEPSEEK_KEY} — model: ${DEEPSEEK_MODEL}`);
 });
-
