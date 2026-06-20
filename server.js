@@ -6,9 +6,6 @@ const PORT = process.env.PORT || 10000;
 
 app.use(express.json({ limit: "5mb" }));
 
-// ─────────────────────────────
-// CORS
-// ─────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://adesanyademilade16-dotcom.github.io",
   "http://localhost:3000",
@@ -35,14 +32,15 @@ const GROQ_KEYS = [
   process.env.GROQ_API_KEY_3
 ].filter(Boolean);
 
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_KEY     = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL   = "gemini-2.5-flash";
 
-const CEREBRAS_KEY = process.env.CEREBRAS_API_KEY;
-const CEREBRAS_MODEL = "llama-3.3-70b"; // fast + large context
+const CEREBRAS_KEY   = process.env.CEREBRAS_API_KEY;
+const CEREBRAS_MODEL = "llama-3.3-70b";
 
-// Groq llama-3.1-8b-instant has ~8000 token context window.
-// ~1 token ≈ 4 chars, so we cap system+messages at ~24 000 chars to stay safe.
+const DEEPSEEK_KEY   = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_MODEL = "deepseek-chat"; // DeepSeek-V3 — large context, strong reasoning
+
 const GROQ_MAX_CHARS = 24000;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -50,15 +48,12 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function truncateForGroq(messages) {
   let total = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   if (total <= GROQ_MAX_CHARS) return messages;
-
   return messages.map(m => {
     if (m.role === "system" && m.content.length > 8000) {
-      const trimmed = m.content.slice(0, 8000);
-      return { ...m, content: trimmed + "\n\n[...document truncated for model context limit...]" };
+      return { ...m, content: m.content.slice(0, 8000) + "\n\n[...truncated for model context limit...]" };
     }
     if (m.role === "user" && m.content.length > 6000) {
-      const trimmed = m.content.slice(0, 6000);
-      return { ...m, content: trimmed + "\n\n[...truncated...]" };
+      return { ...m, content: m.content.slice(0, 6000) + "\n\n[...truncated...]" };
     }
     return m;
   });
@@ -74,7 +69,9 @@ app.get("/", (req, res) => {
     gemini: !!GEMINI_KEY,
     gemini_model: GEMINI_MODEL,
     cerebras: !!CEREBRAS_KEY,
-    cerebras_model: CEREBRAS_MODEL
+    cerebras_model: CEREBRAS_MODEL,
+    deepseek: !!DEEPSEEK_KEY,
+    deepseek_model: DEEPSEEK_MODEL
   });
 });
 
@@ -85,10 +82,7 @@ async function callGroq(key, fullMessages) {
   const safeMessages = truncateForGroq(fullMessages);
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json"
-    },
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
       messages: safeMessages,
@@ -113,33 +107,22 @@ async function callGemini(fullMessages) {
   const body = {
     contents: turns.length ? turns : [{ role: "user", parts: [{ text: "Hello" }] }]
   };
-  if (systemMsg) {
-    body.systemInstruction = { parts: [{ text: systemMsg.content }] };
-  }
+  if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg.content }] };
 
   return fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
   );
 }
 
 // ─────────────────────────────
 // CEREBRAS CALL
-// Cerebras uses the OpenAI-compatible API format.
-// llama-3.3-70b has a large context window (~128k tokens)
-// so no truncation needed — great for big PDF contexts.
+// OpenAI-compatible, 128k context
 // ─────────────────────────────
 async function callCerebras(fullMessages) {
   return fetch("https://api.cerebras.ai/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${CEREBRAS_KEY}`,
-      "Content-Type": "application/json"
-    },
+    headers: { Authorization: `Bearer ${CEREBRAS_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: CEREBRAS_MODEL,
       messages: fullMessages,
@@ -150,13 +133,29 @@ async function callCerebras(fullMessages) {
 }
 
 // ─────────────────────────────
+// DEEPSEEK CALL
+// OpenAI-compatible, 64k context
+// ─────────────────────────────
+async function callDeepSeek(fullMessages) {
+  return fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${DEEPSEEK_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: fullMessages,
+      temperature: 0.7,
+      max_tokens: 4096
+    })
+  });
+}
+
+// ─────────────────────────────
 // MAIN CHAT ENDPOINT
-// Fallback chain: Groq → Gemini → Cerebras
+// Fallback chain: Groq → Gemini → Cerebras → DeepSeek
 // ─────────────────────────────
 app.post("/chat", async (req, res) => {
   try {
     const { messages, system } = req.body;
-
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: "messages required" });
     }
@@ -170,51 +169,33 @@ app.post("/chat", async (req, res) => {
 
     // ── PASS 1: try every Groq key once ──
     for (let i = 0; i < GROQ_KEYS.length; i++) {
-      const key = GROQ_KEYS[i];
       try {
         console.log(`Trying Groq key ${i + 1}/${GROQ_KEYS.length}`);
-        const response = await callGroq(key, fullMessages);
+        const response = await callGroq(GROQ_KEYS[i], fullMessages);
         console.log("Groq status:", response.status);
 
-        if (response.ok) {
-          const data = await response.json();
-          return res.json(data);
-        }
-
-        if (response.status === 429) {
-          lastError = "groq_429";
-          continue;
-        }
-
+        if (response.ok) return res.json(await response.json());
+        if (response.status === 429) { lastError = "groq_429"; continue; }
         if (response.status === 413) {
-          console.log("Groq 413 — payload too large even after trim, skipping to fallbacks");
-          lastError = "groq_413";
-          allGroqRateLimited = false;
-          break;
+          console.log("Groq 413 — skipping to fallbacks");
+          lastError = "groq_413"; allGroqRateLimited = false; break;
         }
-
-        lastError = await response.text();
-        allGroqRateLimited = false;
-        break;
+        lastError = await response.text(); allGroqRateLimited = false; break;
       } catch (err) {
         console.log("Groq request failed:", err.message);
-        lastError = err.message;
-        allGroqRateLimited = false;
+        lastError = err.message; allGroqRateLimited = false;
       }
     }
 
-    // ── PASS 2: all rate-limited → wait once, retry rotation ──
+    // ── PASS 2: all rate-limited → wait, retry ──
     if (allGroqRateLimited && GROQ_KEYS.length > 0) {
-      console.log("All Groq keys rate-limited — waiting 4s before retry pass");
+      console.log("All Groq keys rate-limited — waiting 4s");
       await sleep(4000);
       for (let i = 0; i < GROQ_KEYS.length; i++) {
         try {
           const response = await callGroq(GROQ_KEYS[i], fullMessages);
           console.log(`Retry pass key ${i + 1} status:`, response.status);
-          if (response.ok) {
-            const data = await response.json();
-            return res.json(data);
-          }
+          if (response.ok) return res.json(await response.json());
           if (response.status === 413) break;
         } catch (_) { /* fall through */ }
       }
@@ -225,27 +206,14 @@ app.post("/chat", async (req, res) => {
       console.log("Using Gemini fallback:", GEMINI_MODEL);
       try {
         const geminiResponse = await callGemini(fullMessages);
-
         if (geminiResponse.ok) {
           const data = await geminiResponse.json();
-          const text =
-            data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-            "No response";
-          return res.json({
-            choices: [{ message: { content: text } }]
-          });
+          const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "No response";
+          return res.json({ choices: [{ message: { content: text } }] });
         }
-
-        const geminiStatus = geminiResponse.status;
         const err = await geminiResponse.text();
         console.log("Gemini error:", err);
         lastError = err;
-
-        // Only fall through to Cerebras on quota/rate errors
-        if (geminiStatus !== 429 && geminiStatus !== 503) {
-          // Hard Gemini error (bad key, invalid request etc) — still try Cerebras
-          console.log(`Gemini hard error ${geminiStatus} — trying Cerebras`);
-        }
       } catch (err) {
         console.log("Gemini request failed:", err.message);
         lastError = err.message;
@@ -258,15 +226,11 @@ app.post("/chat", async (req, res) => {
       try {
         const cerebrasResponse = await callCerebras(fullMessages);
         console.log("Cerebras status:", cerebrasResponse.status);
-
         if (cerebrasResponse.ok) {
           const data = await cerebrasResponse.json();
           const text = data?.choices?.[0]?.message?.content || "No response";
-          return res.json({
-            choices: [{ message: { content: text } }]
-          });
+          return res.json({ choices: [{ message: { content: text } }] });
         }
-
         const err = await cerebrasResponse.text();
         console.log("Cerebras error:", err);
         lastError = err;
@@ -276,24 +240,36 @@ app.post("/chat", async (req, res) => {
       }
     }
 
+    // ── DEEPSEEK FALLBACK ──
+    if (DEEPSEEK_KEY) {
+      console.log("Using DeepSeek fallback:", DEEPSEEK_MODEL);
+      try {
+        const deepseekResponse = await callDeepSeek(fullMessages);
+        console.log("DeepSeek status:", deepseekResponse.status);
+        if (deepseekResponse.ok) {
+          const data = await deepseekResponse.json();
+          const text = data?.choices?.[0]?.message?.content || "No response";
+          return res.json({ choices: [{ message: { content: text } }] });
+        }
+        const err = await deepseekResponse.text();
+        console.log("DeepSeek error:", err);
+        lastError = err;
+      } catch (err) {
+        console.log("DeepSeek request failed:", err.message);
+        lastError = err.message;
+      }
+    }
+
     // ── FINAL SAFE RESPONSE ──
     return res.json({
-      choices: [
-        {
-          message: {
-            content: "AI is currently busy. Please try again in a moment."
-          }
-        }
-      ],
+      choices: [{ message: { content: "AI is currently busy. Please try again in a moment." } }],
       debug: lastError
     });
 
   } catch (error) {
     console.error("SERVER ERROR:", error);
     return res.json({
-      choices: [
-        { message: { content: "Server error but AI is still running." } }
-      ]
+      choices: [{ message: { content: "Server error but AI is still running." } }]
     });
   }
 });
@@ -306,4 +282,5 @@ app.listen(PORT, () => {
   console.log(`📌 Groq keys: ${GROQ_KEYS.length}`);
   console.log(`📌 Gemini enabled: ${!!GEMINI_KEY} (${GEMINI_MODEL})`);
   console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} (${CEREBRAS_MODEL})`);
+  console.log(`📌 DeepSeek enabled: ${!!DEEPSEEK_KEY} (${DEEPSEEK_MODEL})`);
 });
