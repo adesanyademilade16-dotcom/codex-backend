@@ -26,18 +26,26 @@ app.use(cors({
 // ─────────────────────────────
 // KEYS
 // ─────────────────────────────
+// 6 Groq keys — 14,400 req/day each = 86,400 req/day total
 const GROQ_KEYS = [
   process.env.GROQ_API_KEY,
   process.env.GROQ_API_KEY_2,
-  process.env.GROQ_API_KEY_3
+  process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY_4,
+  process.env.GROQ_API_KEY_5,
+  process.env.GROQ_API_KEY_6
 ].filter(Boolean);
 
-// Four Gemini keys — cycled in order, next tried on 429
-const GEMINI_KEYS   = [
+// 8 Gemini keys × 2 models = 16 combos before falling through
+const GEMINI_KEYS = [
   process.env.GEMINI_API_KEY,
   process.env.GEMINI_API_KEY_2,
   process.env.GEMINI_API_KEY_3,
-  process.env.GEMINI_API_KEY_4
+  process.env.GEMINI_API_KEY_4,
+  process.env.GEMINI_API_KEY_5,
+  process.env.GEMINI_API_KEY_6,
+  process.env.GEMINI_API_KEY_7,
+  process.env.GEMINI_API_KEY_8
 ].filter(Boolean);
 // Try gemini-2.0-flash first (highest free quota), then 2.5-flash
 const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
@@ -472,3 +480,4 @@ app.listen(PORT, () => {
   console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} — models: ${CEREBRAS_MODELS.join(" → ")}`);
   console.log(`📌 DeepSeek enabled: ${!!DEEPSEEK_KEY} — model: ${DEEPSEEK_MODEL}`);
 });
+
