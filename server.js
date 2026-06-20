@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import cors from "cors";
 
 const app = express();
@@ -148,31 +148,34 @@ async function callGemini(fullMessages) {
   if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg.content }] };
 
   // Try every key × every model combination until one works
-  for (const key of GEMINI_KEYS) {
-    for (const model of GEMINI_MODELS) {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-      );
+  // ANY error (429, 400, 403, 503) tries the next combo — never bail early
+  let lastErrText = "", lastStatus = 500;
+  for (let ki = 0; ki < GEMINI_KEYS.length; ki++) {
+    const key = GEMINI_KEYS[ki];
+    for (let mi = 0; mi < GEMINI_MODELS.length; mi++) {
+      const model = GEMINI_MODELS[mi];
+      const isLast = ki === GEMINI_KEYS.length - 1 && mi === GEMINI_MODELS.length - 1;
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+        );
 
-      if (response.ok) {
-        console.log(`Gemini success — key index ${GEMINI_KEYS.indexOf(key) + 1}, model: ${model}`);
-        return response;
-      }
-
-      const status = response.status;
-      if (status === 429 || status === 503) {
-        const errText = await response.text();
-        console.log(`Gemini key${GEMINI_KEYS.indexOf(key) + 1}/${model} rate-limited (${status}), trying next combo...`);
-        // If this is the very last combo, return the error response
-        if (key === GEMINI_KEYS[GEMINI_KEYS.length - 1] && model === GEMINI_MODELS[GEMINI_MODELS.length - 1]) {
-          return new Response(errText, { status });
+        if (response.ok) {
+          console.log(`Gemini success — key index ${ki + 1}, model: ${model}`);
+          return response;
         }
-        continue;
-      }
 
-      // Hard error — return as-is
-      return response;
+        lastStatus = response.status;
+        lastErrText = await response.text();
+        console.log(`Gemini key${ki + 1}/${model} failed (${lastStatus}), trying next combo...`);
+
+        if (isLast) return new Response(lastErrText, { status: lastStatus });
+      } catch (err) {
+        console.log(`Gemini key${ki + 1}/${model} threw: ${err.message}`);
+        lastErrText = err.message;
+        if (isLast) return new Response(lastErrText, { status: 500 });
+      }
     }
   }
 }
@@ -480,4 +483,3 @@ app.listen(PORT, () => {
   console.log(`📌 Cerebras enabled: ${!!CEREBRAS_KEY} — models: ${CEREBRAS_MODELS.join(" → ")}`);
   console.log(`📌 DeepSeek enabled: ${!!DEEPSEEK_KEY} — model: ${DEEPSEEK_MODEL}`);
 });
-
