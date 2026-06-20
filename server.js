@@ -32,10 +32,12 @@ const GROQ_KEYS = [
   process.env.GROQ_API_KEY_3
 ].filter(Boolean);
 
-// Two Gemini keys — key 1 tried first, key 2 as backup
+// Four Gemini keys — cycled in order, next tried on 429
 const GEMINI_KEYS   = [
   process.env.GEMINI_API_KEY,
-  process.env.GEMINI_API_KEY_2
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+  process.env.GEMINI_API_KEY_4
 ].filter(Boolean);
 // Try gemini-2.0-flash first (highest free quota), then 2.5-flash
 const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
