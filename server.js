@@ -1,4 +1,4 @@
- import express from "express";
+import express from "express";
 import cors from "cors";
 
 const app = express();
@@ -36,7 +36,7 @@ const GROQ_KEYS = [
   process.env.GROQ_API_KEY_6
 ].filter(Boolean);
 
-// 8 Gemini keys × 2 models = 16 combos before falling through
+// 15 Gemini keys × 2 models = 30 combos before falling through
 const GEMINI_KEYS = [
   process.env.GEMINI_API_KEY,
   process.env.GEMINI_API_KEY_2,
@@ -45,33 +45,36 @@ const GEMINI_KEYS = [
   process.env.GEMINI_API_KEY_5,
   process.env.GEMINI_API_KEY_6,
   process.env.GEMINI_API_KEY_7,
-  process.env.GEMINI_API_KEY_8
+  process.env.GEMINI_API_KEY_8,
+  process.env.GEMINI_API_KEY_9,
+  process.env.GEMINI_API_KEY_10,
+  process.env.GEMINI_API_KEY_11,
+  process.env.GEMINI_API_KEY_12,
+  process.env.GEMINI_API_KEY_13,
+  process.env.GEMINI_API_KEY_14,
+  process.env.GEMINI_API_KEY_15
 ].filter(Boolean);
 // Try gemini-2.0-flash first (highest free quota), then 2.5-flash
 const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
 
 // OpenRouter — OpenAI-compatible, free ":free" models, 20 RPM
-// Best free models as of June 2026 (large context, high quality)
 const OPENROUTER_KEY    = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODELS = [
-  "meta-llama/llama-3.3-70b-instruct:free",   // 128k ctx, fast & reliable
-  "deepseek/deepseek-r1:free",                  // 164k ctx, strong reasoning
-  "qwen/qwen3-coder:free"                       // 1M ctx, excellent general use
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-r1:free",
+  "qwen/qwen3-coder:free"
 ];
 
 // Mistral — free "Experiment" plan (~1B tokens/month, no card needed)
-// mistral-small-latest = Mistral Small 4 (256k context)
 const MISTRAL_KEY   = process.env.MISTRAL_API_KEY;
-const MISTRAL_MODEL = "mistral-small-latest";  // 256k context, OpenAI-compatible
+const MISTRAL_MODEL = "mistral-small-latest";
 
-// Cerebras — ultra-fast inference (~3000 tokens/s on WSE hardware)
+// Cerebras — ultra-fast inference
 // llama-3.3-70b was DEPRECATED Feb 2026. Current models as of June 2026:
-//   gpt-oss-120b  → production, 120B MoE, ~3000 t/s, 128k ctx
-//   zai-glm-4.7   → preview,    355B,     ~1000 t/s, 128k ctx (fallback)
 const CEREBRAS_KEY    = process.env.CEREBRAS_API_KEY;
 const CEREBRAS_MODELS = ["gpt-oss-120b", "zai-glm-4.7"];
 
-// DeepSeek — 64k context, last-resort fallback
+// DeepSeek — last-resort fallback
 const DEEPSEEK_KEY   = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_MODEL = "deepseek-chat";
 
@@ -130,8 +133,7 @@ async function callGroq(key, fullMessages) {
 
 // ─────────────────────────────
 // GEMINI CALL
-// Cycles through both API keys × both models (4 combos total).
-// gemini-2.0-flash has the highest free quota.
+// 15 keys × 2 models = 30 combos — never bails early on any error
 // ─────────────────────────────
 async function callGemini(fullMessages) {
   const systemMsg = fullMessages.find(m => m.role === "system");
@@ -147,7 +149,6 @@ async function callGemini(fullMessages) {
   };
   if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg.content }] };
 
-  // Try every key × every model combination until one works
   // ANY error (429, 400, 403, 503) tries the next combo — never bail early
   let lastErrText = "", lastStatus = 500;
   for (let ki = 0; ki < GEMINI_KEYS.length; ki++) {
@@ -160,16 +161,13 @@ async function callGemini(fullMessages) {
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
           { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
         );
-
         if (response.ok) {
           console.log(`Gemini success — key index ${ki + 1}, model: ${model}`);
           return response;
         }
-
         lastStatus = response.status;
         lastErrText = await response.text();
         console.log(`Gemini key${ki + 1}/${model} failed (${lastStatus}), trying next combo...`);
-
         if (isLast) return new Response(lastErrText, { status: lastStatus });
       } catch (err) {
         console.log(`Gemini key${ki + 1}/${model} threw: ${err.message}`);
@@ -182,9 +180,6 @@ async function callGemini(fullMessages) {
 
 // ─────────────────────────────
 // OPENROUTER CALL
-// OpenAI-compatible. Tries each free model in turn.
-// Free tier: 20 RPM, no daily hard cap on tokens.
-// Model IDs use ":free" suffix — $0/M tokens.
 // ─────────────────────────────
 async function callOpenRouter(fullMessages) {
   for (const model of OPENROUTER_MODELS) {
@@ -205,17 +200,13 @@ async function callOpenRouter(fullMessages) {
           max_tokens: 4096
         })
       });
-
       if (response.ok) {
         console.log(`OpenRouter success: ${model}`);
         return { response, model };
       }
-
       const status = response.status;
       const errText = await response.text();
       console.log(`OpenRouter ${model} failed (${status}): ${errText.slice(0, 120)}`);
-
-      // 429 / 503 → try next model; any other error → bail out
       if (status !== 429 && status !== 503) {
         return { response: new Response(errText, { status }), model };
       }
@@ -223,14 +214,11 @@ async function callOpenRouter(fullMessages) {
       console.log(`OpenRouter ${model} threw: ${err.message}`);
     }
   }
-  return null; // all models failed
+  return null;
 }
 
 // ─────────────────────────────
 // MISTRAL CALL
-// OpenAI-compatible endpoint.
-// mistral-small-latest → Mistral Small 4 (256k context, free Experiment plan).
-// ~1B tokens/month free, 1 RPS rate limit.
 // ─────────────────────────────
 async function callMistral(fullMessages) {
   return fetch("https://api.mistral.ai/v1/chat/completions", {
@@ -250,9 +238,6 @@ async function callMistral(fullMessages) {
 
 // ─────────────────────────────
 // CEREBRAS CALL
-// Tries gpt-oss-120b (production, ~3000 t/s) first,
-// then zai-glm-4.7 (preview, 355B) as secondary.
-// llama-3.3-70b was deprecated Feb 2026.
 // ─────────────────────────────
 async function callCerebras(fullMessages) {
   for (const model of CEREBRAS_MODELS) {
@@ -303,8 +288,8 @@ async function callDeepSeek(fullMessages) {
 // MAIN CHAT ENDPOINT
 //
 // Fallback chain (in order):
-//   1. Groq (3 keys × retry after 4s if all 429)
-//   2. Gemini (2 keys × 2 models = 4 combos)
+//   1. Groq (6 keys × retry after 4s if all 429)
+//   2. Gemini (15 keys × 2 models = 30 combos)
 //   3. OpenRouter (3 free models: Llama 3.3 70B → DeepSeek R1 → Qwen3 Coder)
 //   4. Mistral (mistral-small-latest, 256k context)
 //   5. Cerebras (gpt-oss-120b → zai-glm-4.7)
@@ -330,7 +315,6 @@ app.post("/chat", async (req, res) => {
         console.log(`Trying Groq key ${i + 1}/${GROQ_KEYS.length}`);
         const response = await callGroq(GROQ_KEYS[i], fullMessages);
         console.log("Groq status:", response.status);
-
         if (response.ok) return res.json(await response.json());
         if (response.status === 429) { lastError = "groq_429"; continue; }
         if (response.status === 413) {
@@ -361,7 +345,7 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // ── GEMINI FALLBACK (2 keys × 2 models) ──
+    // ── GEMINI FALLBACK (15 keys × 2 models = 30 combos) ──
     if (GEMINI_KEYS.length > 0) {
       console.log("Trying Gemini fallback...");
       try {
@@ -390,14 +374,14 @@ app.post("/chat", async (req, res) => {
           const text = data?.choices?.[0]?.message?.content || "No response";
           return res.json({ choices: [{ message: { content: text } }] });
         }
-        lastError = `openrouter_all_failed`;
+        lastError = "openrouter_all_failed";
       } catch (err) {
         console.log("OpenRouter threw:", err.message);
         lastError = err.message;
       }
     }
 
-    // ── MISTRAL FALLBACK (mistral-small-latest, 256k ctx) ──
+    // ── MISTRAL FALLBACK ──
     if (MISTRAL_KEY) {
       console.log("Trying Mistral fallback:", MISTRAL_MODEL);
       try {
@@ -422,14 +406,13 @@ app.post("/chat", async (req, res) => {
       console.log("Trying Cerebras fallback (models:", CEREBRAS_MODELS.join(", "), ")");
       try {
         const cerebrasResponse = await callCerebras(fullMessages);
-        console.log("Cerebras status:", cerebrasResponse.status);
-        if (cerebrasResponse.ok) {
+        if (cerebrasResponse && cerebrasResponse.ok) {
           const data = await cerebrasResponse.json();
           const text = data?.choices?.[0]?.message?.content || "No response";
           return res.json({ choices: [{ message: { content: text } }] });
         }
-        const err = await cerebrasResponse.text();
-        console.log("Cerebras error:", err.slice(0, 120));
+        const err = await cerebrasResponse?.text().catch(() => "unknown");
+        console.log("Cerebras error:", err?.slice(0, 120));
         lastError = err;
       } catch (err) {
         console.log("Cerebras threw:", err.message);
