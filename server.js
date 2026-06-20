@@ -36,12 +36,32 @@ const GROQ_KEYS = [
 ].filter(Boolean);
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-
-// gemini-1.5-* and gemini-1.0-* models were fully shut down by Google.
-// gemini-2.5-flash is the current GA, cost-efficient model that works on v1beta.
 const GEMINI_MODEL = "gemini-2.5-flash";
 
+// Groq llama-3.1-8b-instant has ~8000 token context window.
+// ~1 token ≈ 4 chars, so we cap system+messages at ~24 000 chars to stay safe.
+const GROQ_MAX_CHARS = 24000;
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function truncateForGroq(messages) {
+  let total = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+  if (total <= GROQ_MAX_CHARS) return messages;
+
+  // Truncate system message first (it usually holds the big PDF context)
+  return messages.map(m => {
+    if (m.role === "system" && m.content.length > 8000) {
+      const trimmed = m.content.slice(0, 8000);
+      return { ...m, content: trimmed + "\n\n[...document truncated for model context limit...]" };
+    }
+    // Also trim oversized user messages
+    if (m.role === "user" && m.content.length > 6000) {
+      const trimmed = m.content.slice(0, 6000);
+      return { ...m, content: trimmed + "\n\n[...truncated...]" };
+    }
+    return m;
+  });
+}
 
 // ─────────────────────────────
 // HEALTH
@@ -59,6 +79,7 @@ app.get("/", (req, res) => {
 // GROQ CALL
 // ─────────────────────────────
 async function callGroq(key, fullMessages) {
+  const safeMessages = truncateForGroq(fullMessages);
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -67,7 +88,7 @@ async function callGroq(key, fullMessages) {
     },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
-      messages: fullMessages,
+      messages: safeMessages,
       temperature: 0.7,
       max_tokens: 4096
     })
@@ -75,7 +96,7 @@ async function callGroq(key, fullMessages) {
 }
 
 // ─────────────────────────────
-// GEMINI CALL (fixed model + proper system instruction)
+// GEMINI CALL
 // ─────────────────────────────
 async function callGemini(fullMessages) {
   const systemMsg = fullMessages.find(m => m.role === "system");
@@ -139,7 +160,15 @@ app.post("/chat", async (req, res) => {
           continue; // try next key
         }
 
-        // Hard error (not a rate limit) — stop trying Groq, don't waste the retry pass on it
+        if (response.status === 413) {
+          // Payload too large even after truncation — skip Groq entirely, go Gemini
+          console.log("Groq 413 — payload too large even after trim, using Gemini");
+          lastError = "groq_413";
+          allGroqRateLimited = false;
+          break;
+        }
+
+        // Other hard error
         lastError = await response.text();
         allGroqRateLimited = false;
         break;
@@ -150,7 +179,7 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // ── PASS 2: every key was rate-limited → wait once, then retry the rotation ──
+    // ── PASS 2: all rate-limited → wait once, retry rotation ──
     if (allGroqRateLimited && GROQ_KEYS.length > 0) {
       console.log("All Groq keys rate-limited — waiting 4s before retry pass");
       await sleep(4000);
@@ -162,7 +191,8 @@ app.post("/chat", async (req, res) => {
             const data = await response.json();
             return res.json(data);
           }
-        } catch (_) { /* ignore, fall through to Gemini */ }
+          if (response.status === 413) break; // go to Gemini
+        } catch (_) { /* fall through */ }
       }
     }
 
@@ -192,7 +222,7 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // ── FINAL SAFE RESPONSE (NO 500 CRASH) ──
+    // ── FINAL SAFE RESPONSE ──
     return res.json({
       choices: [
         {
