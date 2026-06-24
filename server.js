@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import cors from "cors";
 
 const app = express();
@@ -58,11 +58,15 @@ const GEMINI_KEYS = [
 const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash"];
 
 // OpenRouter — OpenAI-compatible, free ":free" models, 20 RPM
+// Updated June 2026: deepseek/deepseek-r1:free REMOVED (404, no longer free)
+// New additions: llama-4-scout, llama-4-maverick, openrouter/free auto-router
 const OPENROUTER_KEY    = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODELS = [
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "deepseek/deepseek-r1:free",
-  "qwen/qwen3-coder:free"
+  "meta-llama/llama-3.3-70b-instruct:free",  // 128k ctx, fast & reliable
+  "meta-llama/llama-4-scout:free",            // 128k ctx, fast Llama 4
+  "meta-llama/llama-4-maverick:free",         // 128k ctx, stronger Llama 4
+  "qwen/qwen3-coder:free",                    // 1M ctx, excellent general use
+  "openrouter/free"                            // auto-picks best available free model
 ];
 
 // Mistral — free "Experiment" plan (~1B tokens/month, no card needed)
