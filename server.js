@@ -324,18 +324,21 @@ async function callDeepSeek(fullMessages) {
 // ─────────────────────────────
 function needsWebSearch(text) {
   const q = String(text || "").toLowerCase();
-  if (q.length < 8) return false;
+  if (q.length < 6) return false;
   // skip pure homework / code / definition drills
-  if (/^(write|code|html|css|python|explain simply|define|quiz me|flashcard)/i.test(q.trim())) return false;
+  if (/^(write|code|html|css|python|explain simply|define|quiz me|flashcard|generate an image|draw)/i.test(q.trim())) return false;
   const triggers = [
-    /\b(today|tonight|this week|this month|yesterday|breaking|latest|current|recent|now|2024|2025|2026|2027)\b/i,
+    /\b(today|tonight|this week|this month|yesterday|breaking|latest|current|recent|now|2024|2025|2026|2027|2028)\b/i,
     /\b(who is|who won|who are the|president of|prime minister|governor of)\b/i,
     /\b(top \d+|richest|wealthiest|ranking|leaderboard of|list of)\b/i,
     /\b(news|headline|score|match result|exchange rate|price of|stock)\b/i,
     /\b(when is|what time is|schedule for|jamb|waec|neco|post.?utme)\b/i,
     /\b(weather in|temperature in)\b/i,
     /\bsearch (the )?(web|online|internet)\b/i,
-    /\blook up\b/i
+    /\blook up\b/i,
+    /\b(movie|film|trailer|box office|cast of|released|premiere)\b/i,
+    /\b(marvel|spider-?man|avengers|disney)\b/i,
+    /\b(summarise|summarize).{0,40}\b(movie|film|news)\b/i
   ];
   return triggers.some((re) => re.test(q));
 }
@@ -360,68 +363,102 @@ function pollinationsUrl(prompt) {
 }
 
 async function duckDuckGoSearch(query) {
-  const q = String(query || "").trim().slice(0, 200);
+  const q = String(query || "").trim().slice(0, 220);
   if (!q) return "";
   const lines = [];
+  const ua = { "User-Agent": "Mozilla/5.0 (compatible; CodexHubNova/2.0; +https://codexhub.app)" };
+
+  // 1) DuckDuckGo Instant Answer
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`;
-    const r = await fetch(url, {
-      headers: { "User-Agent": "CodexHubNova/2.0 (study assistant)" },
-      signal: AbortSignal.timeout(8000)
-    });
+    const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(9000) });
     if (r.ok) {
       const data = await r.json();
       if (data.Heading) lines.push(`Topic: ${data.Heading}`);
       if (data.AbstractText) lines.push(`Summary: ${data.AbstractText}`);
       if (data.AbstractURL) lines.push(`Source: ${data.AbstractURL}`);
-      if (data.Answer) lines.push(`Answer: ${data.Answer}`);
-      const related = (data.RelatedTopics || []).slice(0, 6);
+      if (data.Answer) lines.push(`Direct answer: ${data.Answer}`);
+      const related = (data.RelatedTopics || []).slice(0, 8);
       for (const item of related) {
-        if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " (" + item.FirstURL + ")" : ""}`);
+        if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " — " + item.FirstURL : ""}`);
         if (item.Topics) {
-          for (const sub of item.Topics.slice(0, 2)) {
-            if (sub.Text) lines.push(`• ${sub.Text}`);
+          for (const sub of (item.Topics || []).slice(0, 3)) {
+            if (sub.Text) lines.push(`• ${sub.Text}${sub.FirstURL ? " — " + sub.FirstURL : ""}`);
           }
         }
       }
-      const results = (data.Results || []).slice(0, 5);
-      for (const item of results) {
-        if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " (" + item.FirstURL + ")" : ""}`);
+      for (const item of (data.Results || []).slice(0, 5)) {
+        if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " — " + item.FirstURL : ""}`);
       }
     }
   } catch (err) {
     console.log("DDG instant error:", err.message);
   }
 
-  // Fallback: DuckDuckGo lite HTML (best-effort, still free)
-  if (lines.length < 2) {
-    try {
-      const lite = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`;
-      const r2 = await fetch(lite, {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; CodexHub/2.0)" },
-        signal: AbortSignal.timeout(8000)
-      });
-      if (r2.ok) {
-        const html = await r2.text();
-        const re = /<a[^>]+rel="nofollow"[^>]*>([^<]{10,120})<\/a>/gi;
-        let m, n = 0;
-        while ((m = re.exec(html)) && n < 6) {
-          const title = m[1].replace(/\s+/g, " ").trim();
-          if (title && !/^\d+$/.test(title)) {
-            lines.push(`• ${title}`);
-            n++;
-          }
+  // 2) DuckDuckGo HTML (broader web results)
+  try {
+    const htmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+    const r2 = await fetch(htmlUrl, { headers: ua, signal: AbortSignal.timeout(10000) });
+    if (r2.ok) {
+      const html = await r2.text();
+      // result titles + snippets
+      const blockRe = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div)/gi;
+      let m, n = 0;
+      while ((m = blockRe.exec(html)) && n < 8) {
+        const href = m[1].replace(/&amp;/g, "&");
+        const title = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+        const snip = m[3].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+        if (title && title.length > 5) {
+          lines.push(`• ${title}${snip ? " — " + snip.slice(0, 180) : ""}${href ? " [" + href.slice(0, 120) + "]" : ""}`);
+          n++;
         }
       }
-    } catch (err) {
-      console.log("DDG lite error:", err.message);
+      if (n === 0) {
+        // fallback title-only
+        const titleRe = /class="result__a"[^>]*>([\s\S]*?)<\/a>/gi;
+        while ((m = titleRe.exec(html)) && n < 6) {
+          const title = m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+          if (title && title.length > 8) { lines.push(`• ${title}`); n++; }
+        }
+      }
     }
+  } catch (err) {
+    console.log("DDG html error:", err.message);
   }
 
-  if (!lines.length) return "";
+  // 3) Wikipedia summary (good for named entities / films)
+  try {
+    const wikiQ = q.replace(/\b(summarise|summarize|everything about|tell me about|what is|who is)\b/gi, "").trim().slice(0, 80);
+    if (wikiQ.length > 2) {
+      const wurl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiQ)}`;
+      const wr = await fetch(wurl, { headers: ua, signal: AbortSignal.timeout(6000) });
+      if (wr.ok) {
+        const w = await wr.json();
+        if (w.extract) {
+          lines.push(`Wikipedia (${w.title || wikiQ}): ${w.extract}`);
+          if (w.content_urls && w.content_urls.desktop) lines.push(`Wiki URL: ${w.content_urls.desktop.page}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.log("Wiki error:", err.message);
+  }
+
+  // Deduplicate
+  const seen = new Set();
+  const uniq = [];
+  for (const line of lines) {
+    const key = line.slice(0, 80);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(line);
+  }
+
+  if (!uniq.length) return "";
   return (
-    "LIVE WEB SEARCH RESULTS (DuckDuckGo, free). Use these facts. Cite sources when possible. If results are thin, say so.\n" +
-    lines.join("\n")
+    "LIVE WEB SEARCH (DuckDuckGo + Wikipedia, free). Prefer these facts over training memory. " +
+    "If results conflict with old knowledge, trust search. Cite titles/URLs when useful.\\n\\n" +
+    uniq.slice(0, 14).join("\\n")
   );
 }
 
@@ -445,19 +482,40 @@ app.post("/chat", async (req, res) => {
     const lastUserText = lastUser ? String(lastUser.content || "") : "";
 
     // ── FREE IMAGE GENERATION (Pollinations — no key) ──
-    if (needsImageGen(lastUserText) && !hasVision) {
-      const prompt = extractImagePrompt(lastUserText);
-      const url = pollinationsUrl(prompt);
-      console.log("Image gen via Pollinations:", prompt.slice(0, 80));
-      return res.json({
-        choices: [{
-          message: {
-            content:
-              `Here is a generated image for: **${prompt}**\n\n` +
-              `![Generated image](${url})\n\n` +
-              `Image URL: ${url}\n\n_(Free via Pollinations.ai — no API key.)_`
+    // Image gen: if user also attached a reference image, describe it first via Gemini then generate
+    if (needsImageGen(lastUserText)) {
+      let prompt = extractImagePrompt(lastUserText);
+      if (hasVision) {
+        try {
+          const descMsgs = [
+            { role: "system", content: "Describe the main subject in the attached image in one detailed visual paragraph for an image generator. Include hair, face, clothing, style. No chat UI description." },
+            { role: "user", content: "Describe this reference image for recreation: " + lastUserText }
+          ];
+          const gr = await callGemini(descMsgs, visionImages);
+          if (gr && gr.ok) {
+            const gd = await gr.json();
+            const desc = gd?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join(" ") || "";
+            if (desc && desc.length > 20) {
+              prompt = (prompt + ", " + desc).slice(0, 450);
+              console.log("Image gen with vision ref desc");
+            }
           }
-        }],
+        } catch (e) {
+          console.log("vision ref for image gen failed", e.message);
+        }
+      }
+      // Boost anime/character prompts
+      if (/\b(anya|forger|anime|manga|character)\b/i.test(prompt + lastUserText)) {
+        prompt = prompt + ", anime style, detailed face, high quality illustration";
+      }
+      const url = pollinationsUrl(prompt + ", high quality, detailed");
+      console.log("Image gen via Pollinations:", prompt.slice(0, 100));
+      const content =
+        "Here is a generated image for: **" + prompt.slice(0, 120) + "**\n\n" +
+        "![Generated image](" + url + ")\n\n" +
+        "_(Tap and hold the image to save. Free via Pollinations.)_";
+      return res.json({
+        choices: [{ message: { content } }],
         image_url: url,
         tool: "pollinations"
       });
@@ -472,7 +530,7 @@ app.post("/chat", async (req, res) => {
           const searchSystem =
             (system ? system + "\n\n" : "") +
             searchBlock +
-            "\n\nAnswer using the search results above when relevant. Prefer current facts from results over training memory.";
+            "\n\nCRITICAL: Answer using the LIVE SEARCH RESULTS above. If the user asks about a 2025/2026 movie or current event, do NOT substitute older comic arcs or past films unless search says so. Prefer search facts over training memory. If search is thin, say so clearly.";
           fullMessages = [{ role: "system", content: searchSystem }, ...messages];
         }
       } catch (err) {
