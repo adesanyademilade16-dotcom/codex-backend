@@ -452,21 +452,61 @@ async function callGeminiImage(prompt) {
 
 function needsImageGen(text) {
   const q = String(text || "").toLowerCase();
-  return /\b(generate|create|draw|make|design|paint|illustrate)\b.*\b(image|picture|photo|illustration|logo|icon|art)\b/i.test(q)
-    || /\b(image|picture|illustration) of\b/i.test(q)
-    || /\bdraw me\b/i.test(q);
+  return /\b(generate|create|draw|make|design|paint|illustrate)\b.*\b(image|picture|photo|illustration|logo|icon|art|diagram)\b/i.test(q)
+    || /\b(image|picture|illustration|diagram) of\b/i.test(q)
+    || /\bdraw me\b/i.test(q)
+    || /\bdraw and label\b/i.test(q)
+    || /\b(structure of|labelled? diagram|biology assignment).{0,40}\b(amoeba|cell|heart|neuron|leaf|flower)\b/i.test(q)
+    || /\bgenerate.{0,30}\b(diagram|labelled?|structure)\b/i.test(q);
 }
 
 function extractImagePrompt(text) {
-  let t = String(text || "");
-  t = t.replace(/^(please\s+)?(can you\s+)?(generate|create|draw|make|design|paint|illustrate)\s+(an?\s+)?(image|picture|photo|illustration|logo|icon|art)\s+(of\s+)?/i, "");
-  t = t.replace(/\b(for me|please|thanks)\b/gi, "").trim();
-  return t.slice(0, 300) || String(text).slice(0, 300);
+  let raw = String(text || "");
+  const lower = raw.toLowerCase();
+
+  // Educational / textbook diagram intent
+  const edu = raw.match(
+    /(?:draw and label|draw|label|structure of|diagram of|illustration of|generate(?: an?)?(?: image| diagram| picture)?(?: of)?|labelled? diagram of)\s+(?:the\s+)?(?:structure of\s+)?(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,60})/i
+  );
+  if (edu) {
+    let subject = edu[1].replace(/\b(so i can|for my|assignment|copy|learn|labelling|labeling|please|thanks).*$/i, "").trim();
+    subject = subject.replace(/\b(image|picture|diagram)\b/gi, "").trim() || "specimen";
+    const isBio = /amoeba|cell|bacteria|virus|heart|brain|neuron|leaf|flower|kidney|lung|bone|tissue|organelle|paramecium|euglena/i.test(subject + " " + lower);
+    if (isBio || /biology|assignment|label/i.test(lower)) {
+      return (
+        "clean educational 2D textbook diagram of " + subject +
+        ", black outline on white background, clearly labeled parts with leader lines and text labels, " +
+        "simple scientific school biology illustration, flat diagram style, not photorealistic, not 3D render, not abstract art"
+      );
+    }
+    return (
+      "clean educational 2D labeled diagram of " + subject +
+      ", white background, clear outlines, textbook illustration style, high quality"
+    );
+  }
+
+  // Strip chat fluff
+  let t = raw
+    .replace(/^(okay|ok|hi|hello|please|now)[,\s]+/i, "")
+    .replace(/\b(i was wondering if you can|can you|could you|please|for me|thanks|thank you)\b/gi, " ")
+    .replace(/\b(my biology assignment they asked us to|assignment they asked us to|i want to|so i can draw it and use it for my assignment)\b/gi, " ")
+    .replace(/\b(generate|create|draw|make|design|paint|illustrate)\s+(an?\s+)?(image|picture|photo|illustration|logo|icon|art|diagram)\s+(of\s+)?/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (t.length < 8) t = raw.slice(0, 200);
+  // Prefer short subject-focused prompt
+  if (t.length > 160) {
+    const m2 = t.match(/\b(amoeba|[a-z]{4,20} (?:cell|structure|diagram))\b/i);
+    if (m2) t = m2[0];
+  }
+  return t.slice(0, 280);
 }
 
 function pollinationsUrl(prompt) {
-  const p = encodeURIComponent(prompt).replace(/%20/g, "%20");
-  return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true`;
+  const p = encodeURIComponent(String(prompt || "").slice(0, 400));
+  // seed helps variety; model=flux often cleaner for diagrams on pollinations
+  return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux`;
 }
 
 async function duckDuckGoSearch(query) {
@@ -610,9 +650,11 @@ app.post("/chat", async (req, res) => {
           console.log("vision ref for image gen failed", e.message);
         }
       }
-      if (/\b(anya|forger|anime|manga|aang|avatar|2d|cartoon)\b/i.test(prompt + lastUserText)) {
+      if (/\b(amoeba|diagram|label|biology|structure of|textbook)\b/i.test(prompt + lastUserText)) {
+        // keep educational prompt as-is
+      } else if (/\b(anya|forger|anime|manga|aang|avatar)\b/i.test(prompt + lastUserText)) {
         prompt = prompt + ", clean 2D animation style, sharp lines, high quality illustration";
-      } else {
+      } else if (!/textbook|diagram|label/i.test(prompt)) {
         prompt = prompt + ", high quality, detailed";
       }
 
