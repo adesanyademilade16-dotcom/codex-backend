@@ -605,16 +605,15 @@ function needsImageGen(text) {
 function extractImagePrompt(text) {
   let raw = String(text || "").trim();
 
-  // If frontend accidentally concatenated multiple turns, keep the LAST image-like block
-  const chunks = raw.split(/\n{2,}|\\n\\n/).map((s) => s.trim()).filter(Boolean);
+  // Keep last image-like block if multi-turn paste
+  const chunks = raw.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
   if (chunks.length > 1) {
     const imgChunks = chunks.filter((c) =>
-      /\b(generate|create|draw|make|design|paint|illustrate|image|picture|illustration|spider|diagram)\b/i.test(c)
+      /\b(generate|create|draw|make|design|paint|illustrate|image|picture|illustration|spider|ranger|diagram)\b/i.test(c)
     );
     if (imgChunks.length) raw = imgChunks[imgChunks.length - 1];
   }
 
-  // Strip leading chat fluff only
   raw = raw
     .replace(/^(hey|hi|hello|okay|ok|please|now)[,\s!]*/i, "")
     .replace(/^(i want you to|can you|could you|please)\s+/i, "")
@@ -622,12 +621,13 @@ function extractImagePrompt(text) {
 
   const lower = raw.toLowerCase();
 
-  // School diagram only when clearly educational
+  // School diagram only when clearly educational (not superhero fan art)
   const isAssignmentEdu =
-    /\b(assignment|homework|biology|labelled? diagram|draw and label|structure of|label the)\b/i.test(lower) ||
-    /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis)\b/i.test(lower);
+    (/\b(assignment|homework|biology|labelled? diagram|draw and label|structure of|label the)\b/i.test(lower) ||
+      /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis)\b/i.test(lower)) &&
+    !/\b(spider-?man|power\s*ranger|marvel|disney|pixar|superhero|batman|iron\s*man)\b/i.test(lower);
 
-  if (isAssignmentEdu && !/\b(spider-?man|marvel|disney|pixar|superhero)\b/i.test(lower)) {
+  if (isAssignmentEdu) {
     const subj =
       (raw.match(/(?:structure of|diagram of|label(?:led)?(?: diagram of)?|draw and label)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,40})/i) || [])[1] ||
       "specimen";
@@ -639,24 +639,106 @@ function extractImagePrompt(text) {
     );
   }
 
-  // Prefer a long creative brief as-is (user detailed Spider-Man prompts)
-  if (raw.length > 80) return raw.slice(0, 1400);
+  // SUBJECT FIRST: pull character / main subject so truncation never drops identity
+  const subjectHints = [];
+  const subjectPatterns = [
+    /\b(red\s+power\s+ranger|power\s+rangers?|spider-?man|batman|superman|iron\s*man|wonder\s*woman|avatar\s*aang|goku|naruto)\b/gi,
+    /\b(a\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s+(?:standing|swinging|fighting|wearing|in\s+a)\b/g,
+  ];
+  for (const re of subjectPatterns) {
+    let m;
+    const r2 = new RegExp(re.source, re.flags);
+    while ((m = r2.exec(raw)) !== null) {
+      const hit = (m[0] || "").replace(/^(a|an|the)\s+/i, "").trim();
+      if (hit.length > 3 && hit.length < 60 && !subjectHints.includes(hit)) subjectHints.push(hit);
+      if (subjectHints.length >= 3) break;
+    }
+  }
+  // Explicit "of X" / "image of X"
+  const ofMatch = raw.match(/\b(?:image|picture|illustration|drawing)\s+of\s+([^.,\n]{3,80})/i);
+  if (ofMatch) {
+    const s = ofMatch[1].trim();
+    if (s && !subjectHints.some((h) => h.toLowerCase() === s.toLowerCase())) subjectHints.unshift(s);
+  }
 
-  // Short requests: light cleanup only
-  let t2 = raw
-    .replace(/\b(generate|create|draw|make)\s+(an?\s+)?(image|picture|illustration)\s+(of\s+)?/gi, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (t2.length < 12) t2 = raw;
-  return t2.slice(0, 900);
+  let body = raw.slice(0, 1400);
+  if (subjectHints.length) {
+    const head = subjectHints.slice(0, 2).join(", ");
+    // Prepend identity so Pollinations/URL truncation keeps the character
+    if (!body.toLowerCase().startsWith(head.toLowerCase().slice(0, 12))) {
+      body = head + ". " + body;
+    }
+  }
+  return body.slice(0, 1400);
 }
 
 function pollinationsUrl(prompt) {
-  // Keep a long prompt so detailed briefs (Spider-Man style) are not truncated into nonsense
+  // Subject already prioritized by extractImagePrompt; keep up to 1200 chars
   const p = encodeURIComponent(String(prompt || "").slice(0, 1200));
   const seed = Math.floor(Math.random() * 1e9);
   return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux&seed=${seed}`;
 }
+
+/** Detect if user is asking about a previously generated image */
+function isImageFollowUp(text) {
+  const q = String(text || "").toLowerCase();
+  return /\b(this|that|the)\s+(image|picture|photo|one|drawing|illustration)\b/.test(q)
+    || /\b(does it look|look like|resemble|is that|was that|you generated|you created|previous image|last image)\b/.test(q)
+    || /\b(which one|between (these|this)|compare.*(image|picture))\b/.test(q)
+    || /\b(what did you (draw|generate|create)|describe (the|this|that) image)\b/.test(q);
+}
+
+/** Fetch a remote image URL into Gemini vision payload { mimeType, data } */
+async function fetchImageAsVision(url) {
+  try {
+    const u = String(url || "").trim();
+    if (!u || !/^https?:\/\//i.test(u)) return null;
+    // data URLs
+    if (u.startsWith("data:image/")) {
+      const mm = u.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+      if (mm) return { mimeType: mm[1], data: mm[2].slice(0, 4_000_000) };
+      return null;
+    }
+    const resp = await fetch(u, { signal: AbortSignal.timeout(20000) });
+    if (!resp.ok) {
+      console.log("fetchImageAsVision status", resp.status, u.slice(0, 80));
+      return null;
+    }
+    const ctype = (resp.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+    if (!ctype.startsWith("image/")) {
+      console.log("fetchImageAsVision not image", ctype);
+      return null;
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length < 200 || buf.length > 6_000_000) return null;
+    return { mimeType: ctype, data: buf.toString("base64") };
+  } catch (e) {
+    console.log("fetchImageAsVision error", e.message);
+    return null;
+  }
+}
+
+/** Collect image URLs from recent assistant messages (markdown or plain) */
+function collectPastImageUrls(messages, limit) {
+  const urls = [];
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0 && urls.length < (limit || 3); i--) {
+    const m = list[i];
+    if (!m || m.role !== "assistant") continue;
+    const c = String(m.content || "");
+    const md = c.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)/g);
+    for (const hit of md) {
+      if (hit[1] && !urls.includes(hit[1])) urls.push(hit[1]);
+    }
+    const pol = c.matchAll(/(https?:\/\/image\.pollinations\.ai\/[^\s)\]"']+)/g);
+    for (const hit of pol) {
+      if (hit[1] && !urls.includes(hit[1])) urls.push(hit[1]);
+    }
+    if (m.imageUrl && !urls.includes(m.imageUrl)) urls.push(m.imageUrl);
+  }
+  return urls;
+}
+
 
 
 // ═══════════════════════════════════════════════════════════
@@ -1269,8 +1351,8 @@ app.post("/chat", async (req, res) => {
       ? [{ role: "system", content: system }, ...messages]
       : messages;
 
-    const visionImages = Array.isArray(images) ? images.filter(x => x && x.data && x.mimeType).slice(0, 4) : [];
-    const hasVision = visionImages.length > 0;
+    let visionImages = Array.isArray(images) ? images.filter(x => x && x.data && x.mimeType).slice(0, 4) : [];
+    let hasVision = visionImages.length > 0;
 
     // Latest user text
     const lastUser = [...messages].reverse().find(m => m.role === "user");
@@ -1316,7 +1398,9 @@ app.post("/chat", async (req, res) => {
             "_(Gemini · tap to enlarge)_";
           return res.json({
             choices: [{ message: { content } }],
+            reply: content,
             image_url: gemImg.dataUrl,
+            prompt_used: prompt,
             tool: "gemini-image"
           });
         }
@@ -1335,7 +1419,9 @@ app.post("/chat", async (req, res) => {
             "_(Hugging Face · tap to enlarge)_";
           return res.json({
             choices: [{ message: { content } }],
+            reply: content,
             image_url: hfImg.dataUrl,
+            prompt_used: prompt,
             tool: "huggingface"
           });
         }
@@ -1352,10 +1438,39 @@ app.post("/chat", async (req, res) => {
         "_(Tap image to enlarge · Download below · free fallback)_";
       return res.json({
         choices: [{ message: { content } }],
+        reply: content,
         image_url: url,
+        prompt_used: prompt,
         tool: "pollinations"
       });
     }
+
+    // ── IMAGE MEMORY: if user asks about a past image, load it into vision ──
+    const bodyPast = Array.isArray(req.body.pastImageUrls) ? req.body.pastImageUrls : [];
+    let pastUrls = bodyPast.filter((u) => typeof u === "string" && u.length > 8).slice(0, 3);
+    if (!pastUrls.length && isImageFollowUp(lastUserText)) {
+      pastUrls = collectPastImageUrls(messages, 3);
+    }
+    if (pastUrls.length && !hasVision) {
+      console.log("Image memory: loading", pastUrls.length, "past image(s) for vision");
+      for (const u of pastUrls) {
+        const vis = await fetchImageAsVision(u);
+        if (vis) visionImages.push(vis);
+      }
+      if (visionImages.length) {
+        hasVision = true;
+        const memSys =
+          (system ? system + "\n\n" : "") +
+          "IMAGE MEMORY (mandatory):\n" +
+          "The user is asking about image(s) attached from this chat. You CAN see the pixel content via vision.\n" +
+          "Describe what is ACTUALLY in the image (colors, clothing, face/helmet, pose). " +
+          "If it does NOT match what was requested earlier (e.g. user asked for Red Power Ranger but image shows a different person), say so clearly and honestly.\n" +
+          "Never claim the image is a specific character unless the visible details support it.\n" +
+          "Past image prompt(s) may appear in earlier assistant messages — use them only as context, trust the pixels more.";
+        fullMessages = [{ role: "system", content: memSys }, ...messages.filter((m) => m.role !== "system")];
+      }
+    }
+
 
 // ── FREE WEB SEARCH when query looks time-sensitive ──
     if (needsWebSearch(lastUserText) && !hasVision) {
