@@ -66,9 +66,9 @@ const GEMINI_KEYS = [
 const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"];
 // Image generation models (try in order; free-tier availability varies)
 const GEMINI_IMAGE_MODELS = [
+  "gemini-2.5-flash-image",
   "gemini-3.1-flash-image",
   "gemini-3.1-flash-lite-image",
-  "gemini-2.5-flash-image",
   "gemini-3-pro-image"
 ];
 
@@ -134,10 +134,17 @@ const HUGGINGFACE_KEYS = [
   process.env.HF_TOKEN
 ].filter(Boolean);
 const HF_IMAGE_MODELS = [
-  "black-forest-labs/FLUX.1-dev",
+  // Hub id → tried via Inference Providers router
   "black-forest-labs/FLUX.1-schnell",
-  "stabilityai/stable-diffusion-2",
-  "Qwen/Qwen-Image"
+  "black-forest-labs/FLUX.1-dev",
+  "stabilityai/stable-diffusion-3.5-large-turbo",
+  "stabilityai/stable-diffusion-3.5-large"
+];
+// Fal-native path ids (when hub id routing fails)
+const HF_FAL_PATHS = [
+  "fal-ai/flux/schnell",
+  "fal-ai/flux/dev",
+  "fal-ai/flux/schnell/redux"
 ];
 
 // Premium search APIs (free tiers) — tried before DDG/SearXNG
@@ -516,42 +523,66 @@ async function callGeminiImage(prompt) {
 
 async function callHuggingFaceImage(prompt) {
   if (!HUGGINGFACE_KEYS.length) return null;
-  const text = String(prompt || "").slice(0, 500);
-  const endpoints = (model) => [
-    `https://router.huggingface.co/fal-ai/${model}`,
-    `https://router.huggingface.co/hf-inference/models/${model}`,
-    `https://api-inference.huggingface.co/models/${model}`
-  ];
+  const text = String(prompt || "").slice(0, 800);
+
+  async function tryUrl(url, key, label) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + key,
+        "Content-Type": "application/json",
+        Accept: "image/png"
+      },
+      body: JSON.stringify({ inputs: text, parameters: { num_inference_steps: 8 } }),
+      signal: AbortSignal.timeout(90000)
+    });
+    if (!response.ok) {
+      const errT = await response.text().catch(() => "");
+      console.log("HF image", label, response.status, errT.slice(0, 120));
+      return null;
+    }
+    const ctype = response.headers.get("content-type") || "";
+    if (ctype.includes("application/json")) {
+      const j = await response.json();
+      // some providers return { images: [base64] }
+      if (j.image) return { dataUrl: "data:image/png;base64," + j.image, model: label };
+      if (Array.isArray(j.images) && j.images[0]) {
+        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, "");
+        return { dataUrl: "data:image/png;base64," + b, model: label };
+      }
+      console.log("HF json", JSON.stringify(j).slice(0, 120));
+      return null;
+    }
+    const buf = Buffer.from(await response.arrayBuffer());
+    if (buf.length < 500) return null;
+    return { dataUrl: "data:image/png;base64," + buf.toString("base64"), model: label };
+  }
+
   for (const key of HUGGINGFACE_KEYS) {
+    // A) Fal-native paths via HF router
+    for (const path of HF_FAL_PATHS) {
+      try {
+        const hit = await tryUrl("https://router.huggingface.co/" + path, key, path);
+        if (hit) {
+          console.log("HF image success", path);
+          return hit;
+        }
+      } catch (err) {
+        console.log("HF image threw:", err.message);
+      }
+    }
+    // B) Hub model ids via auto routing
     for (const model of HF_IMAGE_MODELS) {
-      for (const url of endpoints(model)) {
+      for (const base of [
+        "https://router.huggingface.co/hf-inference/models/",
+        "https://api-inference.huggingface.co/models/"
+      ]) {
         try {
-          const response = await fetch(url, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${key}`,
-              "Content-Type": "application/json",
-              Accept: "image/png"
-            },
-            body: JSON.stringify({ inputs: text, parameters: { num_inference_steps: 8 } }),
-            signal: AbortSignal.timeout(60000)
-          });
-          if (!response.ok) {
-            const errT = await response.text().catch(() => "");
-            console.log("HF image", model, response.status, errT.slice(0, 100));
-            continue;
+          const hit = await tryUrl(base + model, key, model);
+          if (hit) {
+            console.log("HF image success", model);
+            return hit;
           }
-          const ctype = response.headers.get("content-type") || "";
-          if (ctype.includes("application/json")) {
-            const j = await response.json();
-            console.log("HF json", JSON.stringify(j).slice(0, 120));
-            continue;
-          }
-          const buf = Buffer.from(await response.arrayBuffer());
-          if (buf.length < 500) continue;
-          const b64 = buf.toString("base64");
-          console.log("HF image success", model, url.split("/")[3]);
-          return { dataUrl: `data:image/png;base64,${b64}`, model };
         } catch (err) {
           console.log("HF image threw:", err.message);
         }
@@ -573,14 +604,30 @@ function needsImageGen(text) {
 
 function extractImagePrompt(text) {
   let raw = String(text || "").trim();
+
+  // If frontend accidentally concatenated multiple turns, keep the LAST image-like block
+  const chunks = raw.split(/\n{2,}|\\n\\n/).map((s) => s.trim()).filter(Boolean);
+  if (chunks.length > 1) {
+    const imgChunks = chunks.filter((c) =>
+      /\b(generate|create|draw|make|design|paint|illustrate|image|picture|illustration|spider|diagram)\b/i.test(c)
+    );
+    if (imgChunks.length) raw = imgChunks[imgChunks.length - 1];
+  }
+
+  // Strip leading chat fluff only
+  raw = raw
+    .replace(/^(hey|hi|hello|okay|ok|please|now)[,\s!]*/i, "")
+    .replace(/^(i want you to|can you|could you|please)\s+/i, "")
+    .trim();
+
   const lower = raw.toLowerCase();
 
-  // ONLY force textbook style for clear school/assignment science diagrams
+  // School diagram only when clearly educational
   const isAssignmentEdu =
     /\b(assignment|homework|biology|labelled? diagram|draw and label|structure of|label the)\b/i.test(lower) ||
     /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis)\b/i.test(lower);
 
-  if (isAssignmentEdu) {
+  if (isAssignmentEdu && !/\b(spider-?man|marvel|disney|pixar|superhero)\b/i.test(lower)) {
     const subj =
       (raw.match(/(?:structure of|diagram of|label(?:led)?(?: diagram of)?|draw and label)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,40})/i) || [])[1] ||
       "specimen";
@@ -592,23 +639,23 @@ function extractImagePrompt(text) {
     );
   }
 
-  // Creative / general: keep user's style words; strip only chat fluff
-  let t = raw
-    .replace(/^(okay|ok|hi|hello|please|now)[,\s]+/i, "")
-    .replace(/\b(i was wondering if you can|can you|could you|please generate|please create|for me|thanks|thank you)\b/gi, " ")
+  // Prefer a long creative brief as-is (user detailed Spider-Man prompts)
+  if (raw.length > 80) return raw.slice(0, 1400);
+
+  // Short requests: light cleanup only
+  let t2 = raw
+    .replace(/\b(generate|create|draw|make)\s+(an?\s+)?(image|picture|illustration)\s+(of\s+)?/gi, "")
     .replace(/\s+/g, " ")
     .trim();
-
-  // If prompt is already detailed (long creative brief), keep most of it
-  if (t.length > 40) return t.slice(0, 900);
-  if (t.length < 8) t = raw.slice(0, 400);
-  return t.slice(0, 500);
+  if (t2.length < 12) t2 = raw;
+  return t2.slice(0, 900);
 }
 
 function pollinationsUrl(prompt) {
-  const p = encodeURIComponent(String(prompt || "").slice(0, 400));
-  // seed helps variety; model=flux often cleaner for diagrams on pollinations
-  return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux`;
+  // Keep a long prompt so detailed briefs (Spider-Man style) are not truncated into nonsense
+  const p = encodeURIComponent(String(prompt || "").slice(0, 1200));
+  const seed = Math.floor(Math.random() * 1e9);
+  return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux&seed=${seed}`;
 }
 
 
@@ -1232,7 +1279,13 @@ app.post("/chat", async (req, res) => {
     // ── FREE IMAGE GENERATION (Pollinations — no key) ──
     // Image gen: Gemini first → Hugging Face → Pollinations last
     if (needsImageGen(lastUserText)) {
-      let prompt = extractImagePrompt(lastUserText);
+      // Use only the latest user text; strip any leaked assistant headers
+      const cleanUser = String(lastUserText || "")
+        .replace(/Here is a generated image[\s\S]*/gi, "")
+        .replace(/!\[Generated image\][\s\S]*/gi, "")
+        .trim();
+      let prompt = extractImagePrompt(cleanUser || lastUserText);
+      console.log("Image prompt (" + prompt.length + " chars):", prompt.slice(0, 160));
       if (hasVision) {
         try {
           const descMsgs = [
