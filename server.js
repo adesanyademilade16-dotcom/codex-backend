@@ -138,6 +138,25 @@ const HF_IMAGE_MODELS = [
   "ByteDance/SDXL-Lightning"
 ];
 
+// Premium search APIs (free tiers) — tried before DDG/SearXNG
+const SERPER_KEYS = [
+  process.env.SERPER_API_KEY,
+  process.env.SERPER_API_KEY_2,
+  process.env.SERPER_API_KEY_3,
+  process.env.SEPER_API_KEY_3 // typo-tolerant
+].filter(Boolean);
+
+const FIRECRAWL_KEYS = [
+  process.env.FIRECRAWL_API_KEY,
+  process.env.FIRECRAWL_API_KEY_2,
+  process.env.FIRECRAWL_API_KEY_3
+].filter(Boolean);
+
+const PARALLEL_KEYS = [
+  process.env.PARALLEL_API_KEY,
+  process.env.PARALLEL_API_KEY_2
+].filter(Boolean);
+
 const GROQ_MAX_CHARS = 24000;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -176,7 +195,10 @@ app.get("/", (req, res) => {
     deepseek: DEEPSEEK_KEYS.length > 0,
     deepseek_model: DEEPSEEK_MODEL,
     huggingface: HUGGINGFACE_KEYS.length,
-    tools: { web_search: "searxng+ddg+wiki+cache", image_gen: "gemini-hf-pollinations", vision: "gemini", coding_models: OPENROUTER_MODELS, groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"] }
+    serper_keys: SERPER_KEYS.length,
+    firecrawl_keys: FIRECRAWL_KEYS.length,
+    parallel_keys: PARALLEL_KEYS.length,
+    tools: { web_search: "serper+firecrawl+parallel+searxng+ddg+wiki+cache", image_gen: "gemini-hf-pollinations", vision: "gemini", coding_models: OPENROUTER_MODELS, groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"] }
   });
 });
 
@@ -710,6 +732,127 @@ async function searxSearch(query) {
   return lines;
 }
 
+
+async function serperSearch(query) {
+  const lines = [];
+  for (const key of SERPER_KEYS) {
+    try {
+      const r = await fetch("https://google.serper.dev/search", {
+        method: "POST",
+        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+        body: JSON.stringify({ q: query, num: 8 }),
+        signal: AbortSignal.timeout(12000)
+      });
+      if (!r.ok) {
+        console.log("Serper status", r.status);
+        continue;
+      }
+      const data = await r.json();
+      if (data.answerBox) {
+        const ab = data.answerBox;
+        if (ab.answer) lines.push("Direct: " + ab.answer);
+        if (ab.snippet) lines.push("AnswerBox: " + ab.snippet);
+        if (ab.title) lines.push("AnswerBox title: " + ab.title);
+      }
+      if (data.knowledgeGraph) {
+        const kg = data.knowledgeGraph;
+        if (kg.title) lines.push("KG: " + kg.title + (kg.description ? " — " + kg.description : ""));
+      }
+      for (const item of (data.organic || []).slice(0, 8)) {
+        const title = (item.title || "").trim();
+        const snip = (item.snippet || "").trim();
+        const link = item.link || "";
+        if (title) lines.push("• " + title + (snip ? " — " + snip.slice(0, 220) : "") + (link ? " [" + link + "]" : ""));
+      }
+      if (lines.length) {
+        console.log("Serper HIT, results:", lines.length);
+        return lines;
+      }
+    } catch (err) {
+      console.log("Serper error:", err.message);
+    }
+  }
+  return lines;
+}
+
+async function firecrawlSearch(query) {
+  const lines = [];
+  for (const key of FIRECRAWL_KEYS) {
+    try {
+      const r = await fetch("https://api.firecrawl.dev/v1/search", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+        body: JSON.stringify({ query, limit: 6 }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (!r.ok) {
+        console.log("Firecrawl status", r.status);
+        continue;
+      }
+      const data = await r.json();
+      const results = data.data || data.results || [];
+      for (const item of results.slice(0, 6)) {
+        const title = (item.title || "").trim();
+        const desc = (item.description || item.snippet || item.markdown || "").toString().replace(/\s+/g, " ").trim();
+        const link = item.url || item.link || "";
+        if (title || desc) {
+          lines.push("• " + (title || link) + (desc ? " — " + desc.slice(0, 240) : "") + (link ? " [" + link + "]" : ""));
+        }
+      }
+      if (lines.length) {
+        console.log("Firecrawl HIT, results:", lines.length);
+        return lines;
+      }
+    } catch (err) {
+      console.log("Firecrawl error:", err.message);
+    }
+  }
+  return lines;
+}
+
+async function parallelSearch(query) {
+  const lines = [];
+  for (const key of PARALLEL_KEYS) {
+    try {
+      const r = await fetch("https://api.parallel.ai/v1/search", {
+        method: "POST",
+        headers: { "x-api-key": key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          objective: query,
+          search_queries: [query.slice(0, 80)],
+          mode: "fast"
+        }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (!r.ok) {
+        console.log("Parallel status", r.status, await r.text().catch(() => ""));
+        continue;
+      }
+      const data = await r.json();
+      const results = data.results || data.output || data.data || [];
+      const arr = Array.isArray(results) ? results : [];
+      for (const item of arr.slice(0, 8)) {
+        const title = (item.title || item.name || "").trim();
+        const snip = (item.excerpts || item.excerpt || item.snippet || item.content || item.text || "").toString();
+        const snipFlat = Array.isArray(snip) ? snip.join(" ") : snip;
+        const link = item.url || item.link || "";
+        if (title || snipFlat) {
+          lines.push("• " + (title || "Result") + (snipFlat ? " — " + String(snipFlat).replace(/\s+/g, " ").slice(0, 240) : "") + (link ? " [" + link + "]" : ""));
+        }
+      }
+      // some responses put text at top level
+      if (!arr.length && data.answer) lines.push(String(data.answer).slice(0, 500));
+      if (lines.length) {
+        console.log("Parallel HIT, results:", lines.length);
+        return lines;
+      }
+    } catch (err) {
+      console.log("Parallel error:", err.message);
+    }
+  }
+  return lines;
+}
+
 /** Full free search pipeline: cache → knowledge → SearXNG → DDG → Wiki */
 async function freeWebSearch(query) {
   const q = String(query || "").trim().slice(0, 220);
@@ -732,6 +875,40 @@ async function freeWebSearch(query) {
     lines.push(prior);
   }
 
+  // A) Serper (Google results) — best free-tier ranking data
+  try {
+    const ser = await serperSearch(q);
+    if (ser.length) {
+      lines.push("Serper (Google) results:");
+      lines.push(...ser);
+    }
+  } catch (err) {
+    console.log("Serper pipeline error:", err.message);
+  }
+
+  // B) Firecrawl search
+  try {
+    const fc = await firecrawlSearch(q);
+    if (fc.length) {
+      lines.push("Firecrawl results:");
+      lines.push(...fc);
+    }
+  } catch (err) {
+    console.log("Firecrawl pipeline error:", err.message);
+  }
+
+  // C) Parallel AI search
+  try {
+    const par = await parallelSearch(q);
+    if (par.length) {
+      lines.push("Parallel AI results:");
+      lines.push(...par);
+    }
+  } catch (err) {
+    console.log("Parallel pipeline error:", err.message);
+  }
+
+  // If premium search already gave solid results, we can still add free sources as extras
   // 1) SearXNG multi-instance
   try {
     const sx = await searxSearch(q);
@@ -835,7 +1012,7 @@ async function freeWebSearch(query) {
   if (!uniq.length) return "";
 
   const block =
-    "LIVE WEB SEARCH (SearXNG + DuckDuckGo + Wikipedia, free). Prefer these facts over training memory. " +
+    "LIVE WEB SEARCH (Serper + Firecrawl + Parallel + SearXNG + DDG + Wikipedia). Prefer these facts over training memory. " +
     "If results conflict with old knowledge, trust search. Cite titles/URLs when useful.\\n\\n" +
     uniq.slice(0, 16).join("\\n");
 
@@ -1039,7 +1216,7 @@ app.post("/chat", async (req, res) => {
     const lastUserText = lastUser ? String(lastUser.content || "") : "";
 
     // ── FREE IMAGE GENERATION (Pollinations — no key) ──
-    // Image gen: HF first → Gemini → Pollinations
+    // Image gen: Gemini first → Hugging Face → Pollinations last
     if (needsImageGen(lastUserText)) {
       let prompt = extractImagePrompt(lastUserText);
       if (hasVision) {
@@ -1061,26 +1238,7 @@ app.post("/chat", async (req, res) => {
         }
       }
 
-      // 1) Hugging Face first (better quality when credits allow)
-      try {
-        const hfImg = await callHuggingFaceImage(prompt);
-        if (hfImg && hfImg.dataUrl) {
-          console.log("Image gen via HuggingFace:", hfImg.model);
-          const content =
-            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
-            "![Generated image](" + hfImg.dataUrl + ")\n\n" +
-            "_(Hugging Face · tap to enlarge)_";
-          return res.json({
-            choices: [{ message: { content } }],
-            image_url: hfImg.dataUrl,
-            tool: "huggingface"
-          });
-        }
-      } catch (e) {
-        console.log("HF image path failed:", e.message);
-      }
-
-      // 2) Gemini native image
+      // 1) Gemini image (best reliability / quality on free tier)
       try {
         const gemImg = await callGeminiImage(prompt);
         if (gemImg && gemImg.dataUrl) {
@@ -1099,13 +1257,32 @@ app.post("/chat", async (req, res) => {
         console.log("Gemini image path failed:", e.message);
       }
 
-      // 3) Pollinations fallback — pass prompt as-is (no forced textbook style)
+      // 2) Hugging Face (FLUX etc.)
+      try {
+        const hfImg = await callHuggingFaceImage(prompt);
+        if (hfImg && hfImg.dataUrl) {
+          console.log("Image gen via HuggingFace:", hfImg.model);
+          const content =
+            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
+            "![Generated image](" + hfImg.dataUrl + ")\n\n" +
+            "_(Hugging Face · tap to enlarge)_";
+          return res.json({
+            choices: [{ message: { content } }],
+            image_url: hfImg.dataUrl,
+            tool: "huggingface"
+          });
+        }
+      } catch (e) {
+        console.log("HF image path failed:", e.message);
+      }
+
+      // 3) Pollinations last fallback
       const url = pollinationsUrl(prompt);
       console.log("Image gen via Pollinations:", prompt.slice(0, 120));
       const content =
         "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
         "![Generated image](" + url + ")\n\n" +
-        "_(Tap image to enlarge · Download below)_";
+        "_(Tap image to enlarge · Download below · free fallback)_";
       return res.json({
         choices: [{ message: { content } }],
         image_url: url,
@@ -1113,23 +1290,46 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-// ── FREE WEB SEARCH (DuckDuckGo) when query looks time-sensitive ──
+// ── FREE WEB SEARCH when query looks time-sensitive ──
     if (needsWebSearch(lastUserText) && !hasVision) {
+      const antiHallucinate =
+        "ANTI-HALLUCINATION RULES (mandatory):\n" +
+        "1) Do NOT invent ranked lists, box-office tables, or exact dollar figures unless those numbers appear in the LIVE SEARCH text below.\n" +
+        "2) Do NOT invent film titles (e.g. 'Oppenheimer 2', 'Avatar: Way of Water II', 'Barbie Dreamhouse') to fill a top-10 list.\n" +
+        "3) If search results are empty, thin, or conflicting: say live search did not return a reliable ranking, list only titles that search actually mentioned, and point the user to Box Office Mojo / The Numbers / Wikipedia for verified charts.\n" +
+        "4) Never invent URLs or claim Screen Rant / Box Office Mojo published a table you made up.\n" +
+        "5) Prefer admitting uncertainty over a polished fake table. Students need truth, not confidence theater.\n" +
+        "6) If the user corrects you, accept the correction and re-check search facts — do not double down on earlier wrong claims from this chat.";
+
       try {
         console.log("Web search triggered for:", lastUserText.slice(0, 100));
         const searchBlock = await duckDuckGoSearch(lastUserText);
-        if (searchBlock) {
+        if (searchBlock && searchBlock.length > 80) {
           const searchSystem =
             (system ? system + "\n\n" : "") +
             searchBlock +
-            "\n\nCRITICAL: Answer using the LIVE SEARCH RESULTS above. You DO have web search on Codex Hub — never claim you cannot search online when results are present. If the user asks about a 2025/2026 movie or current event, do NOT substitute older comic arcs or past films unless search says so. Prefer search facts over training memory. If search is thin, say so clearly.";
+            "\n\n" + antiHallucinate +
+            "\nCRITICAL: Answer using the LIVE SEARCH RESULTS above. You DO have web search on Codex Hub when results are present. " +
+            "If the user asks about a 2025/2026 movie or current event, use only titles and numbers that appear in search (or clearly label anything else as uncertain).";
           fullMessages = [{ role: "system", content: searchSystem }, ...messages];
+        } else {
+          console.log("Search returned thin/empty block");
+          const sysThin =
+            (system ? system + "\n\n" : "") +
+            antiHallucinate +
+            "\nLIVE SEARCH returned little or no usable data for this query. " +
+            "Do NOT invent a top-10 box-office table. Say search was thin, mention only well-known confirmed facts if any, " +
+            "and give these links for the student to verify: https://www.boxofficemojo.com/year/world/ https://www.the-numbers.com/ https://en.wikipedia.org/wiki/2026_in_film";
+          fullMessages = [{ role: "system", content: sysThin }, ...messages];
         }
       } catch (err) {
         console.log("Search inject failed:", err.message);
-        const sys2 = (system ? system + "\n\n" : "") +
-          "WEB SEARCH was attempted but timed out. Still answer helpfully from best available knowledge about 2025–2026 topics (movies, news). " +
-          "Do NOT say you lack access to the internet as a blanket rule — say live data was temporarily unavailable and give best-known facts plus links users can open (Box Office Mojo, etc.).";
+        const sys2 =
+          (system ? system + "\n\n" : "") +
+          antiHallucinate +
+          "\nWEB SEARCH timed out or failed. Do NOT invent rankings or dollar amounts. " +
+          "Say live search is temporarily unavailable and point to Box Office Mojo / The Numbers. " +
+          "You may mention only widely reported film titles without fake grosses.";
         fullMessages = [{ role: "system", content: sys2 }, ...messages];
       }
     }
@@ -1307,6 +1507,8 @@ app.post("/chat", async (req, res) => {
 // ─────────────────────────────
 // START SERVER
 // ─────────────────────────────
+console.log("📌 Serper keys:", SERPER_KEYS.length, "| Firecrawl:", FIRECRAWL_KEYS.length, "| Parallel:", PARALLEL_KEYS.length);
+console.log("📌 Image order: Gemini → HuggingFace → Pollinations");
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📌 Groq keys: ${GROQ_KEYS.length}`);
