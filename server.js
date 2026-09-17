@@ -176,7 +176,7 @@ app.get("/", (req, res) => {
     deepseek: DEEPSEEK_KEYS.length > 0,
     deepseek_model: DEEPSEEK_MODEL,
     huggingface: HUGGINGFACE_KEYS.length,
-    tools: { web_search: "duckduckgo+wiki", image_gen: "gemini-hf-pollinations", vision: "gemini", coding_models: OPENROUTER_MODELS, groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"] }
+    tools: { web_search: "searxng+ddg+wiki+cache", image_gen: "gemini-hf-pollinations", vision: "gemini", coding_models: OPENROUTER_MODELS, groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"] }
   });
 });
 
@@ -536,46 +536,37 @@ function needsImageGen(text) {
 }
 
 function extractImagePrompt(text) {
-  let raw = String(text || "");
+  let raw = String(text || "").trim();
   const lower = raw.toLowerCase();
 
-  // Educational / textbook diagram intent
-  const edu = raw.match(
-    /(?:draw and label|draw|label|structure of|diagram of|illustration of|generate(?: an?)?(?: image| diagram| picture)?(?: of)?|labelled? diagram of)\s+(?:the\s+)?(?:structure of\s+)?(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,60})/i
-  );
-  if (edu) {
-    let subject = edu[1].replace(/\b(so i can|for my|assignment|copy|learn|labelling|labeling|please|thanks).*$/i, "").trim();
-    subject = subject.replace(/\b(image|picture|diagram)\b/gi, "").trim() || "specimen";
-    const isBio = /amoeba|cell|bacteria|virus|heart|brain|neuron|leaf|flower|kidney|lung|bone|tissue|organelle|paramecium|euglena/i.test(subject + " " + lower);
-    if (isBio || /biology|assignment|label/i.test(lower)) {
-      return (
-        "clean educational 2D textbook diagram of " + subject +
-        ", black outline on white background, clearly labeled parts with leader lines and text labels, " +
-        "simple scientific school biology illustration, flat diagram style, not photorealistic, not 3D render, not abstract art"
-      );
-    }
+  // ONLY force textbook style for clear school/assignment science diagrams
+  const isAssignmentEdu =
+    /\b(assignment|homework|biology|labelled? diagram|draw and label|structure of|label the)\b/i.test(lower) ||
+    /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis)\b/i.test(lower);
+
+  if (isAssignmentEdu) {
+    const subj =
+      (raw.match(/(?:structure of|diagram of|label(?:led)?(?: diagram of)?|draw and label)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,40})/i) || [])[1] ||
+      "specimen";
+    const subject = String(subj).replace(/\b(so i can|for my|assignment|please).*$/i, "").trim();
     return (
-      "clean educational 2D labeled diagram of " + subject +
-      ", white background, clear outlines, textbook illustration style, high quality"
+      "clean educational 2D textbook diagram of " + subject +
+      ", black outline on white background, clearly labeled parts with leader lines and text labels, " +
+      "simple scientific school illustration, flat diagram style, not photorealistic"
     );
   }
 
-  // Strip chat fluff
+  // Creative / general: keep user's style words; strip only chat fluff
   let t = raw
     .replace(/^(okay|ok|hi|hello|please|now)[,\s]+/i, "")
-    .replace(/\b(i was wondering if you can|can you|could you|please|for me|thanks|thank you)\b/gi, " ")
-    .replace(/\b(my biology assignment they asked us to|assignment they asked us to|i want to|so i can draw it and use it for my assignment)\b/gi, " ")
-    .replace(/\b(generate|create|draw|make|design|paint|illustrate)\s+(an?\s+)?(image|picture|photo|illustration|logo|icon|art|diagram)\s+(of\s+)?/gi, "")
+    .replace(/\b(i was wondering if you can|can you|could you|please generate|please create|for me|thanks|thank you)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
 
-  if (t.length < 8) t = raw.slice(0, 200);
-  // Prefer short subject-focused prompt
-  if (t.length > 160) {
-    const m2 = t.match(/\b(amoeba|[a-z]{4,20} (?:cell|structure|diagram))\b/i);
-    if (m2) t = m2[0];
-  }
-  return t.slice(0, 280);
+  // If prompt is already detailed (long creative brief), keep most of it
+  if (t.length > 40) return t.slice(0, 900);
+  if (t.length < 8) t = raw.slice(0, 400);
+  return t.slice(0, 500);
 }
 
 function pollinationsUrl(prompt) {
@@ -584,49 +575,207 @@ function pollinationsUrl(prompt) {
   return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux`;
 }
 
-async function duckDuckGoSearch(query) {
+
+// ═══════════════════════════════════════════════════════════
+// FREE WEB SEARCH: cache + SearXNG multi-instance + DDG + Wiki
+// (No API keys. LLM keys do NOT multiply search capacity.)
+// ═══════════════════════════════════════════════════════════
+
+const SEARCH_CACHE = new Map(); // key -> { text, at }
+const SEARCH_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const SEARCH_CACHE_MAX = 200;
+
+const KNOWLEDGE_CACHE = new Map(); // normalized topic -> { snippet, at, hits }
+const KNOWLEDGE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const KNOWLEDGE_MAX = 150;
+
+/** Public SearXNG instances (rotate on failure). Community-run; may go offline. */
+const SEARX_INSTANCES = [
+  "https://searx.be",
+  "https://search.sapti.me",
+  "https://searx.tiekoetter.com",
+  "https://searx.work",
+  "https://search.bus-hit.me",
+  "https://searx.fmac.xyz"
+];
+
+function normSearchKey(q) {
+  return String(q || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+}
+
+function getCachedSearch(q) {
+  const key = normSearchKey(q);
+  const hit = SEARCH_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > SEARCH_CACHE_TTL_MS) {
+    SEARCH_CACHE.delete(key);
+    return null;
+  }
+  return hit.text;
+}
+
+function setCachedSearch(q, text) {
+  if (!text || text.length < 40) return;
+  const key = normSearchKey(q);
+  if (SEARCH_CACHE.size >= SEARCH_CACHE_MAX) {
+    // drop oldest
+    let oldest = null, oldestAt = Infinity;
+    for (const [k, v] of SEARCH_CACHE) {
+      if (v.at < oldestAt) { oldestAt = v.at; oldest = k; }
+    }
+    if (oldest) SEARCH_CACHE.delete(oldest);
+  }
+  SEARCH_CACHE.set(key, { text, at: Date.now() });
+}
+
+function getKnowledge(q) {
+  const key = normSearchKey(q);
+  // exact
+  let hit = KNOWLEDGE_CACHE.get(key);
+  if (hit && Date.now() - hit.at <= KNOWLEDGE_TTL_MS) {
+    hit.hits = (hit.hits || 0) + 1;
+    return hit.snippet;
+  }
+  // fuzzy: shared keywords (min 3 significant tokens)
+  const tokens = key.split(" ").filter((w) => w.length > 3);
+  if (tokens.length < 2) return null;
+  let best = null, bestScore = 0;
+  for (const [k, v] of KNOWLEDGE_CACHE) {
+    if (Date.now() - v.at > KNOWLEDGE_TTL_MS) continue;
+    let score = 0;
+    for (const w of tokens) if (k.includes(w)) score++;
+    if (score >= Math.min(3, tokens.length) && score > bestScore) {
+      bestScore = score;
+      best = v.snippet;
+    }
+  }
+  return best;
+}
+
+function setKnowledge(q, snippet) {
+  if (!snippet || snippet.length < 80) return;
+  const key = normSearchKey(q);
+  if (KNOWLEDGE_CACHE.size >= KNOWLEDGE_MAX) {
+    let oldest = null, oldestAt = Infinity;
+    for (const [k, v] of KNOWLEDGE_CACHE) {
+      if (v.at < oldestAt) { oldestAt = v.at; oldest = k; }
+    }
+    if (oldest) KNOWLEDGE_CACHE.delete(oldest);
+  }
+  KNOWLEDGE_CACHE.set(key, { snippet: String(snippet).slice(0, 2500), at: Date.now(), hits: 1 });
+}
+
+async function searxSearch(query) {
+  const lines = [];
+  const ua = { "User-Agent": "Mozilla/5.0 (compatible; CodexHubNova/2.0)" };
+  // shuffle order slightly so one dead instance is not always first
+  const order = SEARX_INSTANCES.slice().sort(() => Math.random() - 0.5);
+  for (const base of order) {
+    try {
+      const url =
+        base.replace(/\/$/, "") +
+        "/search?q=" + encodeURIComponent(query) +
+        "&format=json&categories=general&language=en-US";
+      const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(9000) });
+      if (!r.ok) {
+        console.log("SearXNG", base, r.status);
+        continue;
+      }
+      const data = await r.json();
+      const results = data.results || [];
+      if (!results.length) continue;
+      console.log("SearXNG hit:", base, "results:", results.length);
+      for (const item of results.slice(0, 8)) {
+        const title = (item.title || "").replace(/\s+/g, " ").trim();
+        const content = (item.content || item.snippet || "").replace(/\s+/g, " ").trim();
+        const link = item.url || item.href || "";
+        if (title) {
+          lines.push(
+            "• " + title +
+            (content ? " — " + content.slice(0, 200) : "") +
+            (link ? " [" + String(link).slice(0, 140) + "]" : "")
+          );
+        }
+      }
+      if (lines.length) return lines;
+    } catch (err) {
+      console.log("SearXNG error", base, err.message);
+    }
+  }
+  return lines;
+}
+
+/** Full free search pipeline: cache → knowledge → SearXNG → DDG → Wiki */
+async function freeWebSearch(query) {
   const q = String(query || "").trim().slice(0, 220);
   if (!q) return "";
+
+  // 0) In-memory cache (helps when many students ask the same thing)
+  const cached = getCachedSearch(q);
+  if (cached) {
+    console.log("Search cache HIT:", q.slice(0, 60));
+    return cached + "\n\n_(served from Codex search cache · same query asked recently)_";
+  }
+
   const lines = [];
   const ua = { "User-Agent": "Mozilla/5.0 (compatible; CodexHubNova/2.0; +https://codexhub.app)" };
 
-  // 1) DuckDuckGo Instant Answer
+  // Prior shared knowledge (anonymized public facts from earlier successful searches)
+  const prior = getKnowledge(q);
+  if (prior) {
+    lines.push("PRIOR CODEX KNOWLEDGE (from recent successful searches on this server, not private chats):");
+    lines.push(prior);
+  }
+
+  // 1) SearXNG multi-instance
+  try {
+    const sx = await searxSearch(q);
+    if (sx.length) {
+      lines.push("SearXNG web results:");
+      lines.push(...sx);
+    }
+  } catch (err) {
+    console.log("SearXNG pipeline error:", err.message);
+  }
+
+  // 2) DuckDuckGo Instant
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`;
-    const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(9000) });
+    const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(10000) });
     if (r.ok) {
       const data = await r.json();
       if (data.Heading) lines.push(`Topic: ${data.Heading}`);
       if (data.AbstractText) lines.push(`Summary: ${data.AbstractText}`);
       if (data.AbstractURL) lines.push(`Source: ${data.AbstractURL}`);
       if (data.Answer) lines.push(`Direct answer: ${data.Answer}`);
-      const related = (data.RelatedTopics || []).slice(0, 8);
+      const related = (data.RelatedTopics || []).slice(0, 6);
       for (const item of related) {
         if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " — " + item.FirstURL : ""}`);
         if (item.Topics) {
-          for (const sub of (item.Topics || []).slice(0, 3)) {
+          for (const sub of (item.Topics || []).slice(0, 2)) {
             if (sub.Text) lines.push(`• ${sub.Text}${sub.FirstURL ? " — " + sub.FirstURL : ""}`);
           }
         }
-      }
-      for (const item of (data.Results || []).slice(0, 5)) {
-        if (item.Text) lines.push(`• ${item.Text}${item.FirstURL ? " — " + item.FirstURL : ""}`);
       }
     }
   } catch (err) {
     console.log("DDG instant error:", err.message);
   }
 
-  // 2) DuckDuckGo HTML (broader web results)
+  // 3) DuckDuckGo HTML
   try {
     const htmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
-    const r2 = await fetch(htmlUrl, { headers: ua, signal: AbortSignal.timeout(10000) });
+    const r2 = await fetch(htmlUrl, { headers: ua, signal: AbortSignal.timeout(12000) });
     if (r2.ok) {
       const html = await r2.text();
-      // result titles + snippets
       const blockRe = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div)/gi;
       let m, n = 0;
-      while ((m = blockRe.exec(html)) && n < 8) {
+      while ((m = blockRe.exec(html)) && n < 6) {
         const href = m[1].replace(/&amp;/g, "&");
         const title = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
         const snip = m[3].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
@@ -635,25 +784,17 @@ async function duckDuckGoSearch(query) {
           n++;
         }
       }
-      if (n === 0) {
-        // fallback title-only
-        const titleRe = /class="result__a"[^>]*>([\s\S]*?)<\/a>/gi;
-        while ((m = titleRe.exec(html)) && n < 6) {
-          const title = m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-          if (title && title.length > 8) { lines.push(`• ${title}`); n++; }
-        }
-      }
     }
   } catch (err) {
     console.log("DDG html error:", err.message);
   }
 
-  // 3) Wikipedia summary (good for named entities / films)
+  // 4) Wikipedia summary
   try {
-    const wikiQ = q.replace(/\b(summarise|summarize|everything about|tell me about|what is|who is)\b/gi, "").trim().slice(0, 80);
+    let wikiQ = q.replace(/\b(summarise|summarize|everything about|tell me about|what is|who is|search|online|detail|box office)\b/gi, "").trim().slice(0, 80);
     if (wikiQ.length > 2) {
       const wurl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiQ)}`;
-      const wr = await fetch(wurl, { headers: ua, signal: AbortSignal.timeout(6000) });
+      const wr = await fetch(wurl, { headers: ua, signal: AbortSignal.timeout(10000) });
       if (wr.ok) {
         const w = await wr.json();
         if (w.extract) {
@@ -666,24 +807,48 @@ async function duckDuckGoSearch(query) {
     console.log("Wiki error:", err.message);
   }
 
+  // 5) Wikipedia search
+  try {
+    const sUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q.slice(0, 120))}&utf8=1&format=json&origin=*`;
+    const sr = await fetch(sUrl, { headers: ua, signal: AbortSignal.timeout(10000) });
+    if (sr.ok) {
+      const sj = await sr.json();
+      const hits = (sj.query && sj.query.search) || [];
+      hits.slice(0, 5).forEach((h) => {
+        lines.push(`Wikipedia hit: ${h.title} — ${(h.snippet || "").replace(/<[^>]+>/g, "")}`);
+      });
+    }
+  } catch (err) {
+    console.log("Wiki search error:", err.message);
+  }
+
   // Deduplicate
   const seen = new Set();
   const uniq = [];
   for (const line of lines) {
-    const key = line.slice(0, 80);
+    const key = line.slice(0, 90);
     if (seen.has(key)) continue;
     seen.add(key);
     uniq.push(line);
   }
 
   if (!uniq.length) return "";
-  return (
-    "LIVE WEB SEARCH (DuckDuckGo + Wikipedia, free). Prefer these facts over training memory. " +
+
+  const block =
+    "LIVE WEB SEARCH (SearXNG + DuckDuckGo + Wikipedia, free). Prefer these facts over training memory. " +
     "If results conflict with old knowledge, trust search. Cite titles/URLs when useful.\\n\\n" +
-    uniq.slice(0, 14).join("\\n")
-  );
+    uniq.slice(0, 16).join("\\n");
+
+  setCachedSearch(q, block);
+  // Store a compact knowledge snippet for similar future questions (public facts only)
+  setKnowledge(q, uniq.slice(0, 8).join("\\n"));
+  return block;
 }
 
+// Back-compat alias
+async function duckDuckGoSearch(query) {
+  return freeWebSearch(query);
+}
 
 
 // ─────────────────────────────
@@ -874,7 +1039,7 @@ app.post("/chat", async (req, res) => {
     const lastUserText = lastUser ? String(lastUser.content || "") : "";
 
     // ── FREE IMAGE GENERATION (Pollinations — no key) ──
-    // Image gen: Gemini image models first, Pollinations fallback
+    // Image gen: HF first → Gemini → Pollinations
     if (needsImageGen(lastUserText)) {
       let prompt = extractImagePrompt(lastUserText);
       if (hasVision) {
@@ -888,49 +1053,23 @@ app.post("/chat", async (req, res) => {
             const gd = await gr.json();
             const desc = gd?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join(" ") || "";
             if (desc && desc.length > 20) {
-              prompt = (prompt + ", " + desc).slice(0, 450);
+              prompt = (prompt + ", " + desc).slice(0, 850);
             }
           }
         } catch (e) {
           console.log("vision ref for image gen failed", e.message);
         }
       }
-      if (/\b(amoeba|diagram|label|biology|structure of|textbook)\b/i.test(prompt + lastUserText)) {
-        // keep educational prompt as-is
-      } else if (/\b(anya|forger|anime|manga|aang|avatar)\b/i.test(prompt + lastUserText)) {
-        prompt = prompt + ", clean 2D animation style, sharp lines, high quality illustration";
-      } else if (!/textbook|diagram|label/i.test(prompt)) {
-        prompt = prompt + ", high quality, detailed";
-      }
 
-      // 1) Gemini native image (better quality when available)
-      try {
-        const gemImg = await callGeminiImage(prompt);
-        if (gemImg && gemImg.dataUrl) {
-          console.log("Image gen via Gemini:", gemImg.model);
-          const content =
-            "Here is a generated image for: **" + prompt.slice(0, 120) + "**\n\n" +
-            "![Generated image](" + gemImg.dataUrl + ")\n\n" +
-            "_(Generated with Gemini · tap image to enlarge)_";
-          return res.json({
-            choices: [{ message: { content } }],
-            image_url: gemImg.dataUrl,
-            tool: "gemini-image"
-          });
-        }
-      } catch (e) {
-        console.log("Gemini image path failed:", e.message);
-      }
-
-      // 2) Hugging Face Inference (optional)
+      // 1) Hugging Face first (better quality when credits allow)
       try {
         const hfImg = await callHuggingFaceImage(prompt);
         if (hfImg && hfImg.dataUrl) {
           console.log("Image gen via HuggingFace:", hfImg.model);
           const content =
-            "Here is a generated image for: **" + prompt.slice(0, 120) + "**\n\n" +
+            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
             "![Generated image](" + hfImg.dataUrl + ")\n\n" +
-            "_(Generated with Hugging Face · tap to enlarge)_";
+            "_(Hugging Face · tap to enlarge)_";
           return res.json({
             choices: [{ message: { content } }],
             image_url: hfImg.dataUrl,
@@ -941,13 +1080,32 @@ app.post("/chat", async (req, res) => {
         console.log("HF image path failed:", e.message);
       }
 
-      // 3) Pollinations free URL fallback
+      // 2) Gemini native image
+      try {
+        const gemImg = await callGeminiImage(prompt);
+        if (gemImg && gemImg.dataUrl) {
+          console.log("Image gen via Gemini:", gemImg.model);
+          const content =
+            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
+            "![Generated image](" + gemImg.dataUrl + ")\n\n" +
+            "_(Gemini · tap to enlarge)_";
+          return res.json({
+            choices: [{ message: { content } }],
+            image_url: gemImg.dataUrl,
+            tool: "gemini-image"
+          });
+        }
+      } catch (e) {
+        console.log("Gemini image path failed:", e.message);
+      }
+
+      // 3) Pollinations fallback — pass prompt as-is (no forced textbook style)
       const url = pollinationsUrl(prompt);
-      console.log("Image gen via Pollinations:", prompt.slice(0, 100));
+      console.log("Image gen via Pollinations:", prompt.slice(0, 120));
       const content =
-        "Here is a generated image for: **" + prompt.slice(0, 120) + "**\n\n" +
+        "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
         "![Generated image](" + url + ")\n\n" +
-        "_(Tap image to enlarge · Download below · Free fallback)_";
+        "_(Tap image to enlarge · Download below)_";
       return res.json({
         choices: [{ message: { content } }],
         image_url: url,
@@ -955,7 +1113,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // ── FREE WEB SEARCH (DuckDuckGo) when query looks time-sensitive ──
+// ── FREE WEB SEARCH (DuckDuckGo) when query looks time-sensitive ──
     if (needsWebSearch(lastUserText) && !hasVision) {
       try {
         console.log("Web search triggered for:", lastUserText.slice(0, 100));
@@ -964,11 +1122,15 @@ app.post("/chat", async (req, res) => {
           const searchSystem =
             (system ? system + "\n\n" : "") +
             searchBlock +
-            "\n\nCRITICAL: Answer using the LIVE SEARCH RESULTS above. If the user asks about a 2025/2026 movie or current event, do NOT substitute older comic arcs or past films unless search says so. Prefer search facts over training memory. If search is thin, say so clearly.";
+            "\n\nCRITICAL: Answer using the LIVE SEARCH RESULTS above. You DO have web search on Codex Hub — never claim you cannot search online when results are present. If the user asks about a 2025/2026 movie or current event, do NOT substitute older comic arcs or past films unless search says so. Prefer search facts over training memory. If search is thin, say so clearly.";
           fullMessages = [{ role: "system", content: searchSystem }, ...messages];
         }
       } catch (err) {
         console.log("Search inject failed:", err.message);
+        const sys2 = (system ? system + "\n\n" : "") +
+          "WEB SEARCH was attempted but timed out. Still answer helpfully from best available knowledge about 2025–2026 topics (movies, news). " +
+          "Do NOT say you lack access to the internet as a blanket rule — say live data was temporarily unavailable and give best-known facts plus links users can open (Box Office Mojo, etc.).";
+        fullMessages = [{ role: "system", content: sys2 }, ...messages];
       }
     }
 
