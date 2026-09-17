@@ -66,9 +66,10 @@ const GEMINI_KEYS = [
 const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"];
 // Image generation models (try in order; free-tier availability varies)
 const GEMINI_IMAGE_MODELS = [
-  "gemini-2.0-flash-preview-image-generation",
+  "gemini-3.1-flash-image",
+  "gemini-3.1-flash-lite-image",
   "gemini-2.5-flash-image",
-  "gemini-2.0-flash-exp-image-generation"
+  "gemini-3-pro-image"
 ];
 
 // OpenRouter — multiple keys + free models (coder models first for coding quality)
@@ -133,9 +134,10 @@ const HUGGINGFACE_KEYS = [
   process.env.HF_TOKEN
 ].filter(Boolean);
 const HF_IMAGE_MODELS = [
+  "black-forest-labs/FLUX.1-dev",
   "black-forest-labs/FLUX.1-schnell",
-  "stabilityai/stable-diffusion-xl-base-1.0",
-  "ByteDance/SDXL-Lightning"
+  "stabilityai/stable-diffusion-2",
+  "Qwen/Qwen-Image"
 ];
 
 // Premium search APIs (free tiers) — tried before DDG/SearXNG
@@ -473,8 +475,10 @@ function needsWebSearch(text) {
 
 async function callGeminiImage(prompt) {
   const text = String(prompt || "").slice(0, 800);
-  for (const key of GEMINI_KEYS) {
-    for (const model of GEMINI_IMAGE_MODELS) {
+  // Prefer newer GA image models; limit key fan-out to avoid 429 storms
+  const keys = GEMINI_KEYS.slice(0, Math.min(8, GEMINI_KEYS.length));
+  for (const model of GEMINI_IMAGE_MODELS) {
+    for (const key of keys) {
       try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
         const response = await fetch(url, {
@@ -483,11 +487,13 @@ async function callGeminiImage(prompt) {
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: "Generate a high-quality image: " + text }] }],
             generationConfig: { responseModalities: ["TEXT", "IMAGE"] }
-          })
+          }),
+          signal: AbortSignal.timeout(45000)
         });
         if (!response.ok) {
           console.log("Gemini image", model, response.status);
-          continue;
+          if (response.status === 429 || response.status === 403) continue; // try next key
+          break; // 404 etc → next model
         }
         const data = await response.json();
         const parts = data?.candidates?.[0]?.content?.parts || [];
@@ -495,6 +501,7 @@ async function callGeminiImage(prompt) {
           const inline = part.inlineData || part.inline_data;
           if (inline && inline.data) {
             const mime = inline.mimeType || inline.mime_type || "image/png";
+            console.log("Gemini image success", model);
             return { dataUrl: `data:${mime};base64,${inline.data}`, model };
           }
         }
@@ -510,37 +517,44 @@ async function callGeminiImage(prompt) {
 async function callHuggingFaceImage(prompt) {
   if (!HUGGINGFACE_KEYS.length) return null;
   const text = String(prompt || "").slice(0, 500);
+  const endpoints = (model) => [
+    `https://router.huggingface.co/fal-ai/${model}`,
+    `https://router.huggingface.co/hf-inference/models/${model}`,
+    `https://api-inference.huggingface.co/models/${model}`
+  ];
   for (const key of HUGGINGFACE_KEYS) {
     for (const model of HF_IMAGE_MODELS) {
-      try {
-        // Router / inference providers text-to-image
-        const url = `https://router.huggingface.co/hf-inference/models/${model}`;
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${key}`,
-            "Content-Type": "application/json",
-            Accept: "image/png"
-          },
-          body: JSON.stringify({ inputs: text, parameters: { num_inference_steps: 4 } })
-        });
-        if (!response.ok) {
-          const errT = await response.text().catch(() => "");
-          console.log("HF image", model, response.status, errT.slice(0, 120));
-          continue;
+      for (const url of endpoints(model)) {
+        try {
+          const response = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${key}`,
+              "Content-Type": "application/json",
+              Accept: "image/png"
+            },
+            body: JSON.stringify({ inputs: text, parameters: { num_inference_steps: 8 } }),
+            signal: AbortSignal.timeout(60000)
+          });
+          if (!response.ok) {
+            const errT = await response.text().catch(() => "");
+            console.log("HF image", model, response.status, errT.slice(0, 100));
+            continue;
+          }
+          const ctype = response.headers.get("content-type") || "";
+          if (ctype.includes("application/json")) {
+            const j = await response.json();
+            console.log("HF json", JSON.stringify(j).slice(0, 120));
+            continue;
+          }
+          const buf = Buffer.from(await response.arrayBuffer());
+          if (buf.length < 500) continue;
+          const b64 = buf.toString("base64");
+          console.log("HF image success", model, url.split("/")[3]);
+          return { dataUrl: `data:image/png;base64,${b64}`, model };
+        } catch (err) {
+          console.log("HF image threw:", err.message);
         }
-        const ctype = response.headers.get("content-type") || "";
-        if (ctype.includes("application/json")) {
-          const j = await response.json();
-          console.log("HF json err", JSON.stringify(j).slice(0, 150));
-          continue;
-        }
-        const buf = Buffer.from(await response.arrayBuffer());
-        if (buf.length < 500) continue;
-        const b64 = buf.toString("base64");
-        return { dataUrl: `data:image/png;base64,${b64}`, model };
-      } catch (err) {
-        console.log("HF image threw:", err.message);
       }
     }
   }
