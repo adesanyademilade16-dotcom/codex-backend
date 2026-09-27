@@ -10,19 +10,29 @@ const ALLOWED_ORIGINS = [
   "https://adesanyademilade16-dotcom.github.io",
   "http://localhost:3000",
   "http://localhost:8080",
+  "http://127.0.0.1:8080",
   "http://127.0.0.1:5500",
-  "http://localhost:5500"  // if you serve locally with Live Server
-    
+  "http://localhost:5500",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173"
 ];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // same-origin / some mobile webviews
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return true;
+  return false;
+}
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("CORS blocked"));
-    }
-  }
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    return callback(new Error("CORS blocked: " + origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 // ─────────────────────────────
@@ -207,7 +217,14 @@ app.get("/", (req, res) => {
     serper_keys: SERPER_KEYS.length,
     firecrawl_keys: FIRECRAWL_KEYS.length,
     parallel_keys: PARALLEL_KEYS.length,
-    tools: { web_search: "serper+firecrawl+parallel+searxng+ddg+wiki+cache", image_gen: "gemini-hf-pollinations", vision: "gemini", coding_models: OPENROUTER_MODELS, groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"] }
+    tools: {
+      web_search: "serper+firecrawl+parallel+searxng+ddg+wiki+cache",
+      image_search: "serper-images+wikimedia",
+      image_gen: "gemini→huggingface→pollinations (puter client-side fallback)",
+      vision: "gemini",
+      coding_models: OPENROUTER_MODELS,
+      groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"]
+    }
   });
 });
 
@@ -592,8 +609,35 @@ async function callHuggingFaceImage(prompt) {
   return null;
 }
 
+/** Reference / search images (carousel) — NOT AI generation */
+function needsReferenceImages(text) {
+  const q = String(text || "").toLowerCase();
+  if (/\b(generate|create|draw|paint|illustrate|make me)\b.*\b(image|picture|art|logo)\b/i.test(q) &&
+      !/\b(search|online|web|google|reference|find|look\s*up)\b/i.test(q)) {
+    return false;
+  }
+  return (
+    /\b(show|find|search|look\s*up|bring|reference)\b.{0,50}\b(image|images|picture|pictures|photo|photos|diagram|diagrams)\b/i.test(q) ||
+    (/\b(image|images|picture|pictures|photo|photos)\b.{0,40}\b(of|for|about)\b/i.test(q) &&
+      /\b(search|online|web|google|reference|find|look\s*up)\b/i.test(q)) ||
+    /\blabelled?\s+diagram\b|\banatomy\s+diagram\b|\btextbook\s+figure\b/i.test(q) ||
+    (/\b(sea\s+animals?|animals?|species)\b/i.test(q) && /\b(image|images|picture|pictures|photo|photos)\b/i.test(q))
+  );
+}
+
+function extractReferenceQuery(text) {
+  const t = String(text || "").trim();
+  let m = t.match(/(?:images?|pictures?|photos?|diagrams?|references?)\s+(?:of|for|about|on)\s+(.+)$/i);
+  if (m) return m[1].replace(/[?.!].*$/, "").trim().slice(0, 100);
+  m = t.match(/(?:search|look\s*up|find|show)\s+(?:online\s+)?(?:for\s+)?(.+?)(?:\s+and\s+bring|\s+with\s+images?|\s+images?|\s+pictures?)?$/i);
+  if (m) return m[1].replace(/[?.!].*$/, "").trim().slice(0, 100);
+  return t.replace(/\b(please|online|search|images?|pictures?|photos?|reference|bring|show|me|and)\b/gi, " ").replace(/\s+/g, " ").trim().slice(0, 100);
+}
+
 function needsImageGen(text) {
   const q = String(text || "").toLowerCase();
+  // Reference / web image search is handled separately — do not treat as generation
+  if (needsReferenceImages(text)) return false;
   return /\b(generate|create|draw|make|design|paint|illustrate)\b.*\b(image|picture|photo|illustration|logo|icon|art|diagram)\b/i.test(q)
     || /\b(image|picture|illustration|diagram) of\b/i.test(q)
     || /\bdraw me\b/i.test(q)
@@ -916,6 +960,87 @@ async function serperSearch(query) {
     }
   }
   return lines;
+}
+
+/** Serper Images API → real reference photos for carousel */
+async function serperImageSearch(query, limit = 6) {
+  const out = [];
+  for (const key of SERPER_KEYS) {
+    try {
+      const r = await fetch("https://google.serper.dev/images", {
+        method: "POST",
+        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+        body: JSON.stringify({ q: query, num: limit }),
+        signal: AbortSignal.timeout(12000)
+      });
+      if (!r.ok) {
+        console.log("Serper images status", r.status);
+        continue;
+      }
+      const data = await r.json();
+      for (const img of (data.images || []).slice(0, limit)) {
+        const url = img.imageUrl || img.thumbnailUrl || img.link;
+        if (!url) continue;
+        out.push({
+          url,
+          full: img.imageUrl || img.link || url,
+          title: img.title || query,
+          source: "serper",
+          link: img.link || ""
+        });
+      }
+      if (out.length) {
+        console.log("Serper images HIT:", out.length);
+        return out;
+      }
+    } catch (err) {
+      console.log("Serper images error:", err.message);
+    }
+  }
+  return out;
+}
+
+/** Wikimedia Commons — free fallback when Serper has no keys / fails */
+async function wikimediaImageSearch(query, limit = 6) {
+  const out = [];
+  try {
+    const url =
+      "https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6" +
+      "&gsrsearch=" + encodeURIComponent(query) +
+      "&gsrlimit=" + limit +
+      "&prop=imageinfo&iiprop=url|mime|size&iiurlwidth=640&format=json&origin=*";
+    const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!r.ok) throw new Error("wikimedia_" + r.status);
+    const data = await r.json();
+    const pages = data?.query?.pages || {};
+    for (const id of Object.keys(pages)) {
+      const p = pages[id];
+      const info = (p.imageinfo && p.imageinfo[0]) || null;
+      if (!info) continue;
+      if (info.mime && !/^image\//i.test(info.mime)) continue;
+      const src = info.thumburl || info.url;
+      if (!src) continue;
+      out.push({
+        url: src,
+        full: info.url || src,
+        title: String(p.title || "").replace(/^File:/i, ""),
+        source: "wikimedia"
+      });
+    }
+  } catch (err) {
+    console.log("Wikimedia images error:", err.message);
+  }
+  return out;
+}
+
+async function searchReferenceImages(query, limit = 6) {
+  let images = await serperImageSearch(query, limit);
+  let provider = images.length ? "serper" : "none";
+  if (!images.length) {
+    images = await wikimediaImageSearch(query, limit);
+    if (images.length) provider = "wikimedia";
+  }
+  return { query, provider, images };
 }
 
 async function firecrawlSearch(query) {
@@ -1358,8 +1483,33 @@ app.post("/chat", async (req, res) => {
     const lastUser = [...messages].reverse().find(m => m.role === "user");
     const lastUserText = lastUser ? String(lastUser.content || "") : "";
 
-    // ── FREE IMAGE GENERATION (Pollinations — no key) ──
-    // Image gen: Gemini first → Hugging Face → Pollinations last
+    // ── REFERENCE IMAGE SEARCH (carousel) — real photos, not AI gen ──
+    if (needsReferenceImages(lastUserText) && !hasVision) {
+      try {
+        const q = extractReferenceQuery(lastUserText);
+        console.log("Reference image search for:", q);
+        const { images, provider } = await searchReferenceImages(q, 6);
+        if (images && images.length) {
+          const list = images.map((im, i) => `${i + 1}. ${im.title || "Image"} — ${im.full || im.url}`).join("\n");
+          const searchSystem =
+            (system ? system + "\n\n" : "") +
+            "REFERENCE IMAGES (already fetched via " + provider + "). " +
+            "Write a short educational description for the student. Do NOT invent Pollinations or fake image URLs. " +
+            "The app will display a swipeable carousel of these real images.\n" +
+            list;
+          fullMessages = [{ role: "system", content: searchSystem }, ...messages.filter((m) => m.role !== "system")];
+          // Continue into normal chat so the model describes the animals, then return images for the client
+          // We stash images on res for the final response wrapper below via a flag
+          req._refImages = images;
+          req._refProvider = provider;
+        }
+      } catch (e) {
+        console.log("Reference image search failed:", e.message);
+      }
+    }
+
+    // ── IMAGE GENERATION ──
+    // Order by quality: Gemini → Hugging Face FLUX → Pollinations (last). Puter is client-side fallback.
     if (needsImageGen(lastUserText)) {
       // Use only the latest user text; strip any leaked assistant headers
       const cleanUser = String(lastUserText || "")
@@ -1689,8 +1839,38 @@ app.post("/chat", async (req, res) => {
 // ─────────────────────────────
 // START SERVER
 // ─────────────────────────────
+// ─────────────────────────────
+// IMAGE SEARCH (carousel for Nova reference photos / diagrams)
+// ─────────────────────────────
+app.get("/image-search", async (req, res) => {
+  try {
+    const q = String(req.query.q || req.query.query || "").trim().slice(0, 120);
+    const limit = Math.min(10, Math.max(2, Number(req.query.limit) || 6));
+    if (!q) return res.status(400).json({ error: "q required", images: [] });
+    const result = await searchReferenceImages(q, limit);
+    return res.json(result);
+  } catch (error) {
+    console.error("image-search GET", error);
+    return res.status(500).json({ error: "search_failed", images: [] });
+  }
+});
+
+app.post("/image-search", async (req, res) => {
+  try {
+    const q = String(req.body?.q || req.body?.query || "").trim().slice(0, 120);
+    const limit = Math.min(10, Math.max(2, Number(req.body?.limit) || 6));
+    if (!q) return res.status(400).json({ error: "q required", images: [] });
+    const result = await searchReferenceImages(q, limit);
+    return res.json(result);
+  } catch (error) {
+    console.error("image-search POST", error);
+    return res.status(500).json({ error: "search_failed", images: [] });
+  }
+});
+
 console.log("📌 Serper keys:", SERPER_KEYS.length, "| Firecrawl:", FIRECRAWL_KEYS.length, "| Parallel:", PARALLEL_KEYS.length);
-console.log("📌 Image order: Gemini → HuggingFace → Pollinations");
+console.log("📌 Image gen order: Gemini → HuggingFace → Pollinations (Puter = client fallback)");
+console.log("📌 Image search: Serper Images + Wikimedia fallback");
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📌 Groq keys: ${GROQ_KEYS.length}`);
