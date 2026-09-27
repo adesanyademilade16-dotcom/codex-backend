@@ -29,11 +29,25 @@ function isAllowedOrigin(origin) {
 app.use(cors({
   origin: (origin, callback) => {
     if (isAllowedOrigin(origin)) return callback(null, true);
+    console.log("CORS blocked origin:", origin);
     return callback(new Error("CORS blocked: " + origin));
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  credentials: false
 }));
+
+// Explicit preflight so mobile browsers never hang on OPTIONS
+app.options("*", (req, res) => {
+  const origin = req.headers.origin || "";
+  if (isAllowedOrigin(origin) || !origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    return res.status(204).end();
+  }
+  return res.status(403).end();
+});
 
 // ─────────────────────────────
 // KEYS
@@ -963,14 +977,44 @@ async function serperSearch(query) {
 }
 
 /** Serper Images API → real reference photos for carousel */
+function isJunkImageResult(title, url) {
+  const s = ((title || "") + " " + (url || "")).toLowerCase();
+  const junk = [
+    "carousel", "mockup", "template", "ui kit", "figma", "framer", "dribbble",
+    "behance", "wallpaper pack", "stock mock", "phone mockup", "screenshot",
+    "landing page", "web design", "app design", "ux design", "ui design",
+    "presentation", "powerpoint", "canva", "pinterest board", "swipeable",
+    "component library", "bootstrap", "tailwind ui", "movie poster", "box office",
+    "netflix", "watch the best movies", "iphone mock", "device frame",
+    "mavi", "interactive component", "how to create a", "account colours"
+  ];
+  return junk.some((k) => s.includes(k));
+}
+
+/** Prefer real wildlife / photo results over UI mockups */
+function refineImageQuery(query) {
+  let q = String(query || "").trim();
+  if (/\b(animal|animals|wildlife|fish|shark|dolphin|whale|octopus|coral|sea|ocean|bird|mammal|species)\b/i.test(q)) {
+    q = q + " wildlife nature animal photograph";
+  } else if (/\b(diagram|anatomy|labelled|labeled|structure)\b/i.test(q)) {
+    q = q + " educational diagram textbook";
+  } else if (!/\b(photo|photograph|biology)\b/i.test(q)) {
+    q = q + " photograph";
+  }
+  // Negative keywords as plain text (Serper supports -term)
+  q = q + " -mockup -carousel -template -figma -dribbble -behance -ui -ux";
+  return q.slice(0, 160);
+}
+
 async function serperImageSearch(query, limit = 6) {
   const out = [];
+  const q = refineImageQuery(query);
   for (const key of SERPER_KEYS) {
     try {
       const r = await fetch("https://google.serper.dev/images", {
         method: "POST",
         headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-        body: JSON.stringify({ q: query, num: limit }),
+        body: JSON.stringify({ q, num: Math.min(20, limit * 3) }),
         signal: AbortSignal.timeout(12000)
       });
       if (!r.ok) {
@@ -978,19 +1022,22 @@ async function serperImageSearch(query, limit = 6) {
         continue;
       }
       const data = await r.json();
-      for (const img of (data.images || []).slice(0, limit)) {
+      for (const img of (data.images || [])) {
+        if (out.length >= limit) break;
         const url = img.imageUrl || img.thumbnailUrl || img.link;
         if (!url) continue;
+        const title = img.title || query;
+        if (isJunkImageResult(title, url) || isJunkImageResult(title, img.link || "")) continue;
         out.push({
           url,
           full: img.imageUrl || img.link || url,
-          title: img.title || query,
+          title,
           source: "serper",
           link: img.link || ""
         });
       }
       if (out.length) {
-        console.log("Serper images HIT:", out.length);
+        console.log("Serper images HIT (filtered):", out.length, "q=", q.slice(0, 60));
         return out;
       }
     } catch (err) {
@@ -1034,11 +1081,22 @@ async function wikimediaImageSearch(query, limit = 6) {
 }
 
 async function searchReferenceImages(query, limit = 6) {
+  // Prefer Serper photos, fill gaps from Wikimedia (great for wildlife/educational)
   let images = await serperImageSearch(query, limit);
   let provider = images.length ? "serper" : "none";
-  if (!images.length) {
-    images = await wikimediaImageSearch(query, limit);
-    if (images.length) provider = "wikimedia";
+  if (images.length < limit) {
+    const wiki = await wikimediaImageSearch(query, limit);
+    const seen = new Set(images.map((x) => x.full || x.url));
+    for (const w of wiki) {
+      if (images.length >= limit) break;
+      const key = w.full || w.url;
+      if (key && !seen.has(key)) {
+        images.push(w);
+        seen.add(key);
+      }
+    }
+    if (wiki.length && provider === "none") provider = "wikimedia";
+    else if (wiki.length && provider === "serper") provider = "serper+wikimedia";
   }
   return { query, provider, images };
 }
