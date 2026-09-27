@@ -221,7 +221,7 @@ app.get("/", (req, res) => {
     tools: {
       web_search: "serper+firecrawl+parallel+searxng+ddg+wiki+cache",
       image_search: "serper-images+wikimedia",
-      image_gen: "gemini→huggingface→pollinations (puter client-side fallback)",
+      image_gen: "gemini→hf-sd3→hf-sdxl→pollinations",
       vision: "gemini",
       coding_models: OPENROUTER_MODELS,
       groq_models: ["openai/gpt-oss-20b","openai/gpt-oss-120b","qwen/qwen3.6-27b"]
@@ -2065,6 +2065,72 @@ app.post("/chat", async (req, res) => {
 // ─────────────────────────────
 // IMAGE SEARCH (carousel for Nova reference photos / diagrams)
 // ─────────────────────────────
+
+// ─────────────────────────────
+// IMAGE GENERATION (Nova + Student Tools)
+// Same chain: Gemini (if quota) → HF SD3 → HF SDXL → Pollinations
+// ─────────────────────────────
+app.post("/image-gen", async (req, res) => {
+  try {
+    const promptRaw = String(req.body?.prompt || req.body?.q || req.body?.text || "").trim();
+    if (!promptRaw || promptRaw.length < 2) {
+      return res.status(400).json({ error: "prompt required" });
+    }
+    let prompt = extractImagePrompt(promptRaw);
+    prompt = enhanceImagePrompt(prompt, false);
+    console.log("image-gen:", prompt.slice(0, 160));
+
+    // 1) Gemini (skip quickly on free-tier 0 quota)
+    try {
+      const gemImg = await callGeminiImage(prompt, []);
+      if (gemImg && gemImg.dataUrl) {
+        return res.json({
+          ok: true,
+          image_url: gemImg.dataUrl,
+          image_mime_type: (gemImg.dataUrl.split(";")[0] || "").replace("data:", "") || "image/png",
+          prompt_used: prompt,
+          tool: "gemini-image",
+          image_profile: imageProfileForPrompt(prompt)
+        });
+      }
+    } catch (e) {
+      console.log("image-gen Gemini failed:", e.message);
+    }
+
+    // 2) Hugging Face SD3 / SDXL
+    try {
+      const hfImg = await callHuggingFaceImage(prompt);
+      if (hfImg && hfImg.dataUrl) {
+        return res.json({
+          ok: true,
+          image_url: hfImg.dataUrl,
+          image_mime_type: (hfImg.dataUrl.split(";")[0] || "").replace("data:", "") || "image/png",
+          prompt_used: prompt,
+          tool: "huggingface",
+          model: hfImg.model || null,
+          image_profile: imageProfileForPrompt(prompt)
+        });
+      }
+    } catch (e) {
+      console.log("image-gen HF failed:", e.message);
+    }
+
+    // 3) Pollinations
+    const url = pollinationsUrl(prompt);
+    return res.json({
+      ok: true,
+      image_url: url,
+      image_mime_type: "image/jpeg",
+      prompt_used: prompt,
+      tool: "pollinations",
+      image_profile: imageProfileForPrompt(prompt)
+    });
+  } catch (error) {
+    console.error("image-gen", error);
+    return res.status(500).json({ error: "image_gen_failed", message: error.message });
+  }
+});
+
 app.get("/image-search", async (req, res) => {
   try {
     const q = String(req.query.q || req.query.query || "").trim().slice(0, 120);
