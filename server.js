@@ -89,11 +89,11 @@ const GEMINI_KEYS = [
 ].filter(Boolean);
 const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-flash-latest"];
 // Image generation models (try in order; free-tier availability varies)
+// Current Gemini image model. The Interactions API is used below.
+// Keep this list small: older/preview image model IDs should not create
+// unnecessary 404/429 traffic when the stable model is available.
 const GEMINI_IMAGE_MODELS = [
-  "gemini-2.5-flash-image",
-  "gemini-3.1-flash-image",
-  "gemini-3.1-flash-lite-image",
-  "gemini-3-pro-image"
+  "gemini-3.1-flash-image"
 ];
 
 // OpenRouter — multiple keys + free models (coder models first for coding quality)
@@ -157,19 +157,6 @@ const HUGGINGFACE_KEYS = [
   process.env.HUGGINGFACE_API_KEY_2,
   process.env.HF_TOKEN
 ].filter(Boolean);
-const HF_IMAGE_MODELS = [
-  // Hub id → tried via Inference Providers router
-  "black-forest-labs/FLUX.1-schnell",
-  "black-forest-labs/FLUX.1-dev",
-  "stabilityai/stable-diffusion-3.5-large-turbo",
-  "stabilityai/stable-diffusion-3.5-large"
-];
-// Fal-native path ids (when hub id routing fails)
-const HF_FAL_PATHS = [
-  "fal-ai/flux/schnell",
-  "fal-ai/flux/dev",
-  "fal-ai/flux/schnell/redux"
-];
 
 // Premium search APIs (free tiers) — tried before DDG/SearXNG
 const SERPER_KEYS = [
@@ -512,49 +499,117 @@ function needsWebSearch(text) {
 
 
 async function callGeminiImage(prompt) {
-  const text = String(prompt || "").slice(0, 800);
-  // Prefer newer GA image models; limit key fan-out to avoid 429 storms
-  const keys = GEMINI_KEYS.slice(0, Math.min(8, GEMINI_KEYS.length));
-  for (const model of GEMINI_IMAGE_MODELS) {
-    for (const key of keys) {
+  const text = String(prompt || "").trim().slice(0, 1800);
+  if (!text || !GEMINI_KEYS.length) {
+    console.log("Gemini image skipped: no prompt or Gemini keys");
+    return null;
+  }
+
+  // Google currently documents image generation through the Interactions API.
+  // We deliberately try every configured key because this backend is configured
+  // with keys from separate accounts/projects. Never print the actual key.
+  const models = GEMINI_IMAGE_MODELS;
+
+  for (const model of models) {
+    for (let i = 0; i < GEMINI_KEYS.length; i++) {
+      const key = GEMINI_KEYS[i];
       try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: "Generate a high-quality image: " + text }] }],
-            generationConfig: { responseModalities: ["TEXT", "IMAGE"] }
-          }),
-          signal: AbortSignal.timeout(45000)
-        });
+        const response = await fetch(
+          "https://generativelanguage.googleapis.com/v1beta/interactions",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": key
+            },
+            body: JSON.stringify({
+              model,
+              input: [
+                {
+                  type: "text",
+                  text: "Generate a high-quality image based on this request. Follow the subject, composition, style, and any requested labels exactly:\n\n" + text
+                }
+              ],
+              response_format: {
+                type: "image",
+                mime_type: "image/png",
+                image_size: "1K"
+              }
+            }),
+            signal: AbortSignal.timeout(90000)
+          }
+        );
+
+        const raw = await response.text().catch(() => "");
+
         if (!response.ok) {
-          console.log("Gemini image", model, response.status);
-          if (response.status === 429 || response.status === 403) continue; // try next key
-          break; // 404 etc → next model
+          // Keep enough of Google's response to identify quota/billing/model
+          // problems without ever exposing an API key.
+          console.log(
+            `Gemini image key ${i + 1}/${GEMINI_KEYS.length} ${model} -> ${response.status}: ${raw.slice(0, 700)}`
+          );
+          continue;
         }
-        const data = await response.json();
-        const parts = data?.candidates?.[0]?.content?.parts || [];
-        for (const part of parts) {
-          const inline = part.inlineData || part.inline_data;
-          if (inline && inline.data) {
-            const mime = inline.mimeType || inline.mime_type || "image/png";
-            console.log("Gemini image success", model);
-            return { dataUrl: `data:${mime};base64,${inline.data}`, model };
+
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          console.log(`Gemini image key ${i + 1}: invalid JSON response`);
+          continue;
+        }
+
+        // Interactions API convenience field.
+        const outputImage = data?.output_image;
+        if (outputImage?.data) {
+          const mime = outputImage.mime_type || outputImage.mimeType || "image/png";
+          console.log(`Gemini image SUCCESS — key ${i + 1}/${GEMINI_KEYS.length}, model: ${model}`);
+          return {
+            dataUrl: `data:${mime};base64,${outputImage.data}`,
+            model,
+            provider: "gemini"
+          };
+        }
+
+        // Defensive fallback for interleaved output blocks.
+        const steps = Array.isArray(data?.steps) ? data.steps : [];
+        for (const step of steps) {
+          const blocks = Array.isArray(step?.content) ? step.content : [];
+          for (const block of blocks) {
+            if (block?.type === "image" && block?.data) {
+              const mime = block.mime_type || block.mimeType || "image/png";
+              console.log(`Gemini image SUCCESS (step) — key ${i + 1}/${GEMINI_KEYS.length}, model: ${model}`);
+              return {
+                dataUrl: `data:${mime};base64,${block.data}`,
+                model,
+                provider: "gemini"
+              };
+            }
           }
         }
+
+        console.log(`Gemini image key ${i + 1}: HTTP 200 but no image output`);
       } catch (err) {
-        console.log("Gemini image threw:", err.message);
+        console.log(`Gemini image key ${i + 1} threw:`, err?.message || String(err));
       }
     }
   }
+
+  console.log("Gemini image: all configured keys/models failed; moving to Hugging Face fallback");
   return null;
 }
 
 
 async function callHuggingFaceImage(prompt) {
   if (!HUGGINGFACE_KEYS.length) return null;
-  const text = String(prompt || "").slice(0, 800);
+  const text = String(prompt || "").trim().slice(0, 1200);
+
+  // These are model IDs currently documented for HF Inference Providers.
+  // The old fal-ai/flux/* URLs in this backend were not valid model endpoints.
+  const models = [
+    "black-forest-labs/FLUX.1-schnell",
+    "stabilityai/stable-diffusion-3-medium-diffusers"
+  ];
 
   async function tryUrl(url, key, label) {
     const response = await fetch(url, {
@@ -564,62 +619,74 @@ async function callHuggingFaceImage(prompt) {
         "Content-Type": "application/json",
         Accept: "image/png"
       },
-      body: JSON.stringify({ inputs: text, parameters: { num_inference_steps: 8 } }),
+      body: JSON.stringify({
+        inputs: text,
+        parameters: {
+          num_inference_steps: 4
+        }
+      }),
       signal: AbortSignal.timeout(90000)
     });
-    if (!response.ok) {
-      const errT = await response.text().catch(() => "");
-      console.log("HF image", label, response.status, errT.slice(0, 120));
-      return null;
-    }
+
+    const raw = await response.arrayBuffer();
     const ctype = response.headers.get("content-type") || "";
-    if (ctype.includes("application/json")) {
-      const j = await response.json();
-      // some providers return { images: [base64] }
-      if (j.image) return { dataUrl: "data:image/png;base64," + j.image, model: label };
-      if (Array.isArray(j.images) && j.images[0]) {
-        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, "");
-        return { dataUrl: "data:image/png;base64," + b, model: label };
-      }
-      console.log("HF json", JSON.stringify(j).slice(0, 120));
+
+    if (!response.ok) {
+      const errText = Buffer.from(raw).toString("utf8");
+      console.log(`HF image ${label} -> ${response.status}: ${errText.slice(0, 700)}`);
       return null;
     }
-    const buf = Buffer.from(await response.arrayBuffer());
-    if (buf.length < 500) return null;
-    return { dataUrl: "data:image/png;base64," + buf.toString("base64"), model: label };
+
+    if (ctype.includes("application/json")) {
+      const jsonText = Buffer.from(raw).toString("utf8");
+      let j;
+      try { j = JSON.parse(jsonText); } catch { j = null; }
+      if (j?.image) return { dataUrl: "data:image/png;base64," + j.image, model: label, provider: "huggingface" };
+      if (Array.isArray(j?.images) && j.images[0]) {
+        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, "");
+        return { dataUrl: "data:image/png;base64," + b, model: label, provider: "huggingface" };
+      }
+      console.log(`HF image ${label}: JSON response without image`);
+      return null;
+    }
+
+    const buf = Buffer.from(raw);
+    if (buf.length < 500) {
+      console.log(`HF image ${label}: image response too small (${buf.length} bytes)`);
+      return null;
+    }
+
+    const mime = ctype.split(";")[0] || "image/png";
+    return {
+      dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
+      model: label,
+      provider: "huggingface"
+    };
   }
 
-  for (const key of HUGGINGFACE_KEYS) {
-    // A) Fal-native paths via HF router
-    for (const path of HF_FAL_PATHS) {
+  for (let k = 0; k < HUGGINGFACE_KEYS.length; k++) {
+    const key = HUGGINGFACE_KEYS[k];
+    for (const model of models) {
       try {
-        const hit = await tryUrl("https://router.huggingface.co/" + path, key, path);
+        // HF's Inference Providers router handles provider selection for the
+        // selected model. We intentionally do not construct provider-specific
+        // fal URLs ourselves.
+        const hit = await tryUrl(
+          "https://router.huggingface.co/hf-inference/models/" + model,
+          key,
+          `key ${k + 1}/${HUGGINGFACE_KEYS.length} ${model}`
+        );
         if (hit) {
-          console.log("HF image success", path);
+          console.log(`HF image SUCCESS — key ${k + 1}/${HUGGINGFACE_KEYS.length}, model: ${model}`);
           return hit;
         }
       } catch (err) {
-        console.log("HF image threw:", err.message);
-      }
-    }
-    // B) Hub model ids via auto routing
-    for (const model of HF_IMAGE_MODELS) {
-      for (const base of [
-        "https://router.huggingface.co/hf-inference/models/",
-        "https://api-inference.huggingface.co/models/"
-      ]) {
-        try {
-          const hit = await tryUrl(base + model, key, model);
-          if (hit) {
-            console.log("HF image success", model);
-            return hit;
-          }
-        } catch (err) {
-          console.log("HF image threw:", err.message);
-        }
+        console.log(`HF image ${model} threw:`, err?.message || String(err));
       }
     }
   }
+
+  console.log("Hugging Face image: all configured keys/models failed; moving to Pollinations fallback");
   return null;
 }
 
