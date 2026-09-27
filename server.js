@@ -498,92 +498,132 @@ function needsWebSearch(text) {
 }
 
 
-async function callGeminiImage(prompt) {
-  const text = String(prompt || "").trim().slice(0, 1800);
+function imageProfileForPrompt(prompt) {
+  const q = String(prompt || '').toLowerCase();
+  const editing = /\b(edit|editing|modify|change|replace|remove|add|fix|retouch|recolor|restyle|transform|turn this|use this image|based on this image|from this image)\b/i.test(q);
+  const poster = /\b(poster|flyer|flier|banner|advert|advertisement|promo|promotional|event graphic|social media graphic|cover design)\b/i.test(q);
+  const diagram = /\b(diagram|flowchart|flow chart|schematic|infographic|labelled? diagram|labeled? diagram|chart|process map|mind map)\b/i.test(q);
+  const scientific = /\b(scientific|biology|biolog(y|ical)|anatom(y|ical)|anatomical|cell|organ|organism|species|dinosaur|fossil|neuron|mitosis|meiosis|chemistry|molecule|atom|physics|laboratory|lab equipment|medical|microscopic|textbook)\b/i.test(q);
+  const educational = /\b(educational|school|assignment|homework|lecture|lesson|study|student|academic|exam|revision|teaching|classroom|textbook|figure|illustration for)\b/i.test(q);
+  const character = /\b(character|hero|villain|mascot|avatar|person|people|portrait|cosplay|anime|cartoon|superhero|power ranger|spider-?man|batman|goku|naruto)\b/i.test(q);
+
+  let aspectRatio = '1:1';
+  let width = 1024;
+  let height = 1024;
+  if (/\b(16:9|landscape|wide|desktop|youtube|thumbnail|cinematic frame)\b/i.test(q)) { aspectRatio = '16:9'; width = 1344; height = 768; }
+  else if (/\b(9:16|portrait|vertical|story|reel|tiktok|phone screen)\b/i.test(q)) { aspectRatio = '9:16'; width = 768; height = 1344; }
+  else if (poster) { aspectRatio = '4:5'; width = 1024; height = 1280; }
+  else if (/\b(4:3|slide|presentation)\b/i.test(q)) { aspectRatio = '4:3'; width = 1152; height = 864; }
+  else if (/\b(3:2)\b/i.test(q)) { aspectRatio = '3:2'; width = 1152; height = 768; }
+
+  let size = (poster || diagram || scientific || educational) ? '2K' : '1K';
+  if (process.env.NOVA_IMAGE_SIZE) size = String(process.env.NOVA_IMAGE_SIZE).trim() || size;
+
+  return { editing, poster, diagram, scientific, educational, character, aspectRatio, width, height, size };
+}
+
+function enhanceImagePrompt(prompt, referenceProvided = false) {
+  const raw = String(prompt || '').trim().replace(/\s+/g, ' ').slice(0, 1600);
+  const p = imageProfileForPrompt(raw);
+  const additions = [];
+
+  if (p.editing || referenceProvided) {
+    additions.push('Use the provided reference image as the source image. Preserve the subject identity, important facial/body features, clothing, pose, and overall composition unless the request explicitly asks to change them. Make only the requested changes.');
+  }
+  if (p.poster) {
+    additions.push('Professional poster/flyer design, strong visual hierarchy, clean composition, readable typography, accurate spelling, balanced margins, polished commercial design, no random extra text, no watermark.');
+  } else if (p.diagram) {
+    additions.push('Precise educational diagram, clean geometry, uncluttered layout, clear hierarchy, accurate relationships between parts, crisp lines, legible labels only when requested, white or neutral background, no decorative clutter.');
+  } else if (p.scientific || p.educational) {
+    additions.push('Scientifically plausible educational figure, accurate proportions and structures, textbook-quality clarity, clean neutral background, precise details, no fantasy anatomy, no random labels, no watermark.');
+  } else if (p.character) {
+    additions.push('Strong subject identity and consistent anatomy, clear silhouette, expressive but natural pose, detailed clothing/materials, polished character illustration or cinematic character render as appropriate.');
+  } else {
+    additions.push('High-quality polished image, coherent composition, natural anatomy, detailed materials and lighting, strong subject clarity, no watermark.');
+  }
+
+  additions.push('Do not add text, labels, logos, signatures, watermarks, or extra objects unless the user explicitly requested them.');
+  return (raw + ' ' + additions.join(' ')).slice(0, 3000);
+}
+
+async function callGeminiImage(prompt, referenceImages = []) {
+  const text = String(prompt || '').trim().slice(0, 2800);
   if (!text || !GEMINI_KEYS.length) {
-    console.log("Gemini image skipped: no prompt or Gemini keys");
+    console.log('Gemini image skipped: no prompt or Gemini keys');
     return null;
   }
 
-  // Google currently documents image generation through the Interactions API.
-  // We deliberately try every configured key because this backend is configured
-  // with keys from separate accounts/projects. Never print the actual key.
+  const profile = imageProfileForPrompt(text);
   const models = GEMINI_IMAGE_MODELS;
 
   for (const model of models) {
     for (let i = 0; i < GEMINI_KEYS.length; i++) {
       const key = GEMINI_KEYS[i];
       try {
-        const response = await fetch(
-          "https://generativelanguage.googleapis.com/v1beta/interactions",
+        const input = [
           {
-            method: "POST",
+            type: 'text',
+            text: 'Generate or edit the image exactly as requested. Prioritize visual accuracy, subject consistency, readable requested text, and professional composition. Request:\n\n' + text
+          }
+        ];
+
+        // Gemini 3.1 Flash Image supports image inputs for editing/reference workflows.
+        for (const ref of (Array.isArray(referenceImages) ? referenceImages.slice(0, 3) : [])) {
+          if (ref?.data && ref?.mimeType && /^image\//i.test(ref.mimeType)) {
+            input.push({ type: 'image', mime_type: ref.mimeType, data: String(ref.data).slice(0, 5_500_000) });
+          }
+        }
+
+        const response = await fetch(
+          'https://generativelanguage.googleapis.com/v1beta/interactions',
+          {
+            method: 'POST',
             headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": key
+              'Content-Type': 'application/json',
+              'x-goog-api-key': key
             },
             body: JSON.stringify({
               model,
-              input: [
-                {
-                  type: "text",
-                  text: "Generate a high-quality image based on this request. Follow the subject, composition, style, and any requested labels exactly:\n\n" + text
-                }
-              ],
+              input,
               response_format: {
-                type: "image",
-                mime_type: "image/png",
-                image_size: "1K"
+                type: 'image',
+                mime_type: 'image/jpeg',
+                aspect_ratio: profile.aspectRatio,
+                image_size: profile.size
               }
             }),
-            signal: AbortSignal.timeout(90000)
+            signal: AbortSignal.timeout(120000)
           }
         );
 
-        const raw = await response.text().catch(() => "");
+        const raw = await response.text().catch(() => '');
 
         if (!response.ok) {
-          // Keep enough of Google's response to identify quota/billing/model
-          // problems without ever exposing an API key.
-          console.log(
-            `Gemini image key ${i + 1}/${GEMINI_KEYS.length} ${model} -> ${response.status}: ${raw.slice(0, 700)}`
-          );
+          console.log(`Gemini image key ${i + 1}/${GEMINI_KEYS.length} ${model} -> ${response.status}: ${raw.slice(0, 700)}`);
           continue;
         }
 
         let data;
-        try {
-          data = JSON.parse(raw);
-        } catch {
+        try { data = JSON.parse(raw); } catch {
           console.log(`Gemini image key ${i + 1}: invalid JSON response`);
           continue;
         }
 
-        // Interactions API convenience field.
         const outputImage = data?.output_image;
         if (outputImage?.data) {
-          const mime = outputImage.mime_type || outputImage.mimeType || "image/png";
-          console.log(`Gemini image SUCCESS — key ${i + 1}/${GEMINI_KEYS.length}, model: ${model}`);
-          return {
-            dataUrl: `data:${mime};base64,${outputImage.data}`,
-            model,
-            provider: "gemini"
-          };
+          const mime = outputImage.mime_type || outputImage.mimeType || 'image/jpeg';
+          console.log(`Gemini image SUCCESS — key ${i + 1}/${GEMINI_KEYS.length}, model: ${model}, ${profile.aspectRatio}, ${profile.size}`);
+          return { dataUrl: `data:${mime};base64,${outputImage.data}`, model, provider: 'gemini', aspectRatio: profile.aspectRatio, imageSize: profile.size };
         }
 
-        // Defensive fallback for interleaved output blocks.
         const steps = Array.isArray(data?.steps) ? data.steps : [];
         for (const step of steps) {
           const blocks = Array.isArray(step?.content) ? step.content : [];
           for (const block of blocks) {
-            if (block?.type === "image" && block?.data) {
-              const mime = block.mime_type || block.mimeType || "image/png";
+            if (block?.type === 'image' && block?.data) {
+              const mime = block.mime_type || block.mimeType || 'image/jpeg';
               console.log(`Gemini image SUCCESS (step) — key ${i + 1}/${GEMINI_KEYS.length}, model: ${model}`);
-              return {
-                dataUrl: `data:${mime};base64,${block.data}`,
-                model,
-                provider: "gemini"
-              };
+              return { dataUrl: `data:${mime};base64,${block.data}`, model, provider: 'gemini', aspectRatio: profile.aspectRatio, imageSize: profile.size };
             }
           }
         }
@@ -595,56 +635,68 @@ async function callGeminiImage(prompt) {
     }
   }
 
-  console.log("Gemini image: all configured keys/models failed; moving to Hugging Face fallback");
+  console.log('Gemini image: all configured keys/models failed; moving to Hugging Face fallback');
   return null;
 }
 
 
 async function callHuggingFaceImage(prompt) {
   if (!HUGGINGFACE_KEYS.length) return null;
-  const text = String(prompt || "").trim().slice(0, 1200);
+  const text = String(prompt || '').trim().slice(0, 2600);
+  const profile = imageProfileForPrompt(text);
 
-  // These are model IDs currently documented for HF Inference Providers.
-  // The old fal-ai/flux/* URLs in this backend were not valid model endpoints.
+  // Current HF text-to-image candidates. FLUX.1-schnell is intentionally removed
+  // from this route because the previous router request returned HTTP 410.
   const models = [
-    "black-forest-labs/FLUX.1-schnell",
-    "stabilityai/stable-diffusion-3-medium-diffusers"
+    { id: 'Qwen/Qwen-Image', steps: 40, guidance: 4.0 },
+    { id: 'black-forest-labs/FLUX.1-Krea-dev', steps: 28, guidance: 4.5 },
+    { id: 'stabilityai/stable-diffusion-3.5-medium', steps: 30, guidance: 5.0 }
   ];
 
-  async function tryUrl(url, key, label) {
+  const negativePrompt = [
+    'blurry', 'low quality', 'low resolution', 'distorted anatomy', 'deformed',
+    'extra limbs', 'duplicate objects', 'bad proportions', 'random text',
+    'watermark', 'logo', 'signature', 'cropped subject'
+  ].join(', ');
+
+  async function tryUrl(url, key, label, settings) {
     const response = await fetch(url, {
-      method: "POST",
+      method: 'POST',
       headers: {
-        Authorization: "Bearer " + key,
-        "Content-Type": "application/json",
-        Accept: "image/png"
+        Authorization: 'Bearer ' + key,
+        'Content-Type': 'application/json',
+        Accept: 'image/png'
       },
       body: JSON.stringify({
         inputs: text,
         parameters: {
-          num_inference_steps: 4
+          num_inference_steps: settings.steps,
+          guidance_scale: settings.guidance,
+          negative_prompt: negativePrompt,
+          width: profile.width,
+          height: profile.height
         }
       }),
-      signal: AbortSignal.timeout(90000)
+      signal: AbortSignal.timeout(120000)
     });
 
     const raw = await response.arrayBuffer();
-    const ctype = response.headers.get("content-type") || "";
+    const ctype = response.headers.get('content-type') || '';
 
     if (!response.ok) {
-      const errText = Buffer.from(raw).toString("utf8");
+      const errText = Buffer.from(raw).toString('utf8');
       console.log(`HF image ${label} -> ${response.status}: ${errText.slice(0, 700)}`);
       return null;
     }
 
-    if (ctype.includes("application/json")) {
-      const jsonText = Buffer.from(raw).toString("utf8");
+    if (ctype.includes('application/json')) {
+      const jsonText = Buffer.from(raw).toString('utf8');
       let j;
       try { j = JSON.parse(jsonText); } catch { j = null; }
-      if (j?.image) return { dataUrl: "data:image/png;base64," + j.image, model: label, provider: "huggingface" };
+      if (j?.image) return { dataUrl: 'data:image/png;base64,' + j.image, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
       if (Array.isArray(j?.images) && j.images[0]) {
-        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, "");
-        return { dataUrl: "data:image/png;base64," + b, model: label, provider: "huggingface" };
+        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, '');
+        return { dataUrl: 'data:image/png;base64,' + b, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
       }
       console.log(`HF image ${label}: JSON response without image`);
       return null;
@@ -656,39 +708,34 @@ async function callHuggingFaceImage(prompt) {
       return null;
     }
 
-    const mime = ctype.split(";")[0] || "image/png";
-    return {
-      dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
-      model: label,
-      provider: "huggingface"
-    };
+    const mime = ctype.split(';')[0] || 'image/png';
+    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
   }
 
   for (let k = 0; k < HUGGINGFACE_KEYS.length; k++) {
     const key = HUGGINGFACE_KEYS[k];
-    for (const model of models) {
+    for (const spec of models) {
       try {
-        // HF's Inference Providers router handles provider selection for the
-        // selected model. We intentionally do not construct provider-specific
-        // fal URLs ourselves.
         const hit = await tryUrl(
-          "https://router.huggingface.co/hf-inference/models/" + model,
+          'https://router.huggingface.co/hf-inference/models/' + spec.id,
           key,
-          `key ${k + 1}/${HUGGINGFACE_KEYS.length} ${model}`
+          `key ${k + 1}/${HUGGINGFACE_KEYS.length} ${spec.id}`,
+          spec
         );
         if (hit) {
-          console.log(`HF image SUCCESS — key ${k + 1}/${HUGGINGFACE_KEYS.length}, model: ${model}`);
+          console.log(`HF image SUCCESS — key ${k + 1}/${HUGGINGFACE_KEYS.length}, model: ${spec.id}, ${profile.aspectRatio}`);
           return hit;
         }
       } catch (err) {
-        console.log(`HF image ${model} threw:`, err?.message || String(err));
+        console.log(`HF image ${spec.id} threw:`, err?.message || String(err));
       }
     }
   }
 
-  console.log("Hugging Face image: all configured keys/models failed; moving to Pollinations fallback");
+  console.log('Hugging Face image: all configured keys/models failed; moving to Pollinations fallback');
   return null;
 }
+
 
 /** Reference / search images (carousel) — NOT AI generation */
 function needsReferenceImages(text) {
@@ -715,56 +762,56 @@ function extractReferenceQuery(text) {
   return t.replace(/\b(please|online|search|images?|pictures?|photos?|reference|bring|show|me|and)\b/gi, " ").replace(/\s+/g, " ").trim().slice(0, 100);
 }
 
-function needsImageGen(text) {
-  const q = String(text || "").toLowerCase();
-  // Reference / web image search is handled separately — do not treat as generation
+function needsImageGen(text, hasVision = false) {
+  const q = String(text || '').toLowerCase();
+  // Reference / web image search is handled separately — do not treat as generation.
   if (needsReferenceImages(text)) return false;
-  return /\b(generate|create|draw|make|design|paint|illustrate)\b.*\b(image|picture|photo|illustration|logo|icon|art|diagram)\b/i.test(q)
-    || /\b(image|picture|illustration|diagram) of\b/i.test(q)
+  if (hasVision && /\b(edit|modify|change|replace|remove|add|fix|retouch|recolor|restyle|transform|use this|based on this|from this|make this)\b/i.test(q)) return true;
+  return /\b(generate|create|draw|make|design|paint|illustrate|render)\b.*\b(image|picture|photo|illustration|logo|icon|art|diagram|poster|flyer|banner|character|figure|graphic)\b/i.test(q)
+    || /\b(image|picture|illustration|diagram|poster|flyer|banner|character|figure)\s+of\b/i.test(q)
     || /\bdraw me\b/i.test(q)
     || /\bdraw and label\b/i.test(q)
-    || /\b(structure of|labelled? diagram|biology assignment).{0,40}\b(amoeba|cell|heart|neuron|leaf|flower)\b/i.test(q)
-    || /\bgenerate.{0,30}\b(diagram|labelled?|structure)\b/i.test(q);
+    || /\b(educational|scientific|anatomical|biology|medical)\s+(image|figure|illustration|diagram)\b/i.test(q)
+    || /\b(create|make|design)\b.{0,60}\b(poster|flyer|banner|character|illustration|infographic)\b/i.test(q)
+    || /\bgenerate.{0,50}\b(diagram|labelled?|labeled?|structure|figure|poster|flyer)\b/i.test(q);
 }
 
 function extractImagePrompt(text) {
-  let raw = String(text || "").trim();
+  let raw = String(text || '').trim();
 
-  // Keep last image-like block if multi-turn paste
   const chunks = raw.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
   if (chunks.length > 1) {
     const imgChunks = chunks.filter((c) =>
-      /\b(generate|create|draw|make|design|paint|illustrate|image|picture|illustration|spider|ranger|diagram)\b/i.test(c)
+      /\b(generate|create|draw|make|design|paint|illustrate|render|image|picture|illustration|poster|flyer|character|diagram|spider|ranger)\b/i.test(c)
     );
     if (imgChunks.length) raw = imgChunks[imgChunks.length - 1];
   }
 
   raw = raw
-    .replace(/^(hey|hi|hello|okay|ok|please|now)[,\s!]*/i, "")
-    .replace(/^(i want you to|can you|could you|please)\s+/i, "")
+    .replace(/^(hey|hi|hello|okay|ok|please|now)[,\s!]*/i, '')
+    .replace(/^(i want you to|can you|could you|please)\s+/i, '')
     .trim();
 
   const lower = raw.toLowerCase();
-
-  // School diagram only when clearly educational (not superhero fan art)
   const isAssignmentEdu =
-    (/\b(assignment|homework|biology|labelled? diagram|draw and label|structure of|label the)\b/i.test(lower) ||
-      /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis)\b/i.test(lower)) &&
+    (/\b(assignment|homework|biology|labelled? diagram|labeled? diagram|draw and label|structure of|label the|scientific|anatomical|textbook|educational)\b/i.test(lower) ||
+      /\b(amoeba|paramecium|euglena|neuron|organelle|mitosis|meiosis|dinosaur|t-?rex|tyrannosaurus|heart|leaf|flower|cell)\b/i.test(lower)) &&
     !/\b(spider-?man|power\s*ranger|marvel|disney|pixar|superhero|batman|iron\s*man)\b/i.test(lower);
 
   if (isAssignmentEdu) {
     const subj =
-      (raw.match(/(?:structure of|diagram of|label(?:led)?(?: diagram of)?|draw and label)\s+(?:an?\s+)?([A-Za-z][A-Za-z0-9 \-]{2,40})/i) || [])[1] ||
-      "specimen";
-    const subject = String(subj).replace(/\b(so i can|for my|assignment|please).*$/i, "").trim();
-    return (
-      "clean educational 2D textbook diagram of " + subject +
-      ", black outline on white background, clearly labeled parts with leader lines and text labels, " +
-      "simple scientific school illustration, flat diagram style, not photorealistic"
+      (raw.match(/(?:structure of|diagram of|image of|picture of|illustration of|label(?:led|ed)?(?: diagram of)?|draw and label)\s+(?:an?\s+)?([^.,\n]{3,90})/i) || [])[1] ||
+      raw.replace(/^(generate|create|draw|make|design|show)\s+/i, '').slice(0, 90) || 'specimen';
+    const subject = String(subj).replace(/\b(so i can|for my|assignment|homework|please|with labels?).*$/i, '').trim();
+    if (/\b(poster|flyer|banner|infographic)\b/i.test(lower)) {
+      return enhanceImagePrompt(raw, false);
+    }
+    return enhanceImagePrompt(
+      'Educational subject: ' + subject + '. Create the requested educational/scientific visual with accurate structures and proportions.',
+      false
     );
   }
 
-  // SUBJECT FIRST: pull character / main subject so truncation never drops identity
   const subjectHints = [];
   const subjectPatterns = [
     /\b(red\s+power\s+ranger|power\s+rangers?|spider-?man|batman|superman|iron\s*man|wonder\s*woman|avatar\s*aang|goku|naruto)\b/gi,
@@ -774,35 +821,32 @@ function extractImagePrompt(text) {
     let m;
     const r2 = new RegExp(re.source, re.flags);
     while ((m = r2.exec(raw)) !== null) {
-      const hit = (m[0] || "").replace(/^(a|an|the)\s+/i, "").trim();
+      const hit = (m[0] || '').replace(/^(a|an|the)\s+/i, '').trim();
       if (hit.length > 3 && hit.length < 60 && !subjectHints.includes(hit)) subjectHints.push(hit);
       if (subjectHints.length >= 3) break;
     }
   }
-  // Explicit "of X" / "image of X"
-  const ofMatch = raw.match(/\b(?:image|picture|illustration|drawing)\s+of\s+([^.,\n]{3,80})/i);
+  const ofMatch = raw.match(/\b(?:image|picture|illustration|drawing|poster|flyer)\s+of\s+([^.,\n]{3,100})/i);
   if (ofMatch) {
     const s = ofMatch[1].trim();
     if (s && !subjectHints.some((h) => h.toLowerCase() === s.toLowerCase())) subjectHints.unshift(s);
   }
 
-  let body = raw.slice(0, 1400);
+  let body = raw.slice(0, 1600);
   if (subjectHints.length) {
-    const head = subjectHints.slice(0, 2).join(", ");
-    // Prepend identity so Pollinations/URL truncation keeps the character
-    if (!body.toLowerCase().startsWith(head.toLowerCase().slice(0, 12))) {
-      body = head + ". " + body;
-    }
+    const head = subjectHints.slice(0, 2).join(', ');
+    if (!body.toLowerCase().startsWith(head.toLowerCase().slice(0, 12))) body = head + '. ' + body;
   }
-  return body.slice(0, 1400);
+  return enhanceImagePrompt(body, false);
 }
 
 function pollinationsUrl(prompt) {
-  // Subject already prioritized by extractImagePrompt; keep up to 1200 chars
-  const p = encodeURIComponent(String(prompt || "").slice(0, 1200));
+  const profile = imageProfileForPrompt(prompt);
+  const p = encodeURIComponent(String(prompt || '').slice(0, 1600));
   const seed = Math.floor(Math.random() * 1e9);
-  return `https://image.pollinations.ai/prompt/${p}?width=1024&height=1024&nologo=true&enhance=true&model=flux&seed=${seed}`;
+  return `https://image.pollinations.ai/prompt/${p}?width=${profile.width}&height=${profile.height}&nologo=true&enhance=true&model=flux&seed=${seed}`;
 }
+
 
 /** Detect if user is asking about a previously generated image */
 function isImageFollowUp(text) {
@@ -1635,48 +1679,49 @@ app.post("/chat", async (req, res) => {
 
     // ── IMAGE GENERATION ──
     // Order by quality: Gemini → Hugging Face FLUX → Pollinations (last). Puter is client-side fallback.
-    if (needsImageGen(lastUserText)) {
+    if (needsImageGen(lastUserText, hasVision)) {
       // Use only the latest user text; strip any leaked assistant headers
       const cleanUser = String(lastUserText || "")
         .replace(/Here is a generated image[\s\S]*/gi, "")
         .replace(/!\[Generated image\][\s\S]*/gi, "")
         .trim();
       let prompt = extractImagePrompt(cleanUser || lastUserText);
-      console.log("Image prompt (" + prompt.length + " chars):", prompt.slice(0, 160));
+      console.log("Image prompt (" + prompt.length + " chars):", prompt.slice(0, 220));
+
+      // If a reference image is attached, Gemini gets the actual pixels for true
+      // edit/reference generation. HF/Pollinations remain text-only fallbacks.
+      let fallbackPrompt = prompt;
       if (hasVision) {
         try {
           const descMsgs = [
-            { role: "system", content: "Describe the main subject in the attached image in one detailed visual paragraph for an image generator. Include hair, face, clothing, style. No chat UI description." },
-            { role: "user", content: "Describe this reference image for recreation: " + lastUserText }
+            { role: "system", content: "Describe the attached reference image for an image generator. Focus on identity, pose, composition, clothing, colors, lighting, and important visual details. Do not describe the chat UI. Do not invent details that are not visible." },
+            { role: "user", content: "Describe this reference image for recreation/editing according to this request: " + lastUserText }
           ];
-          const gr = await callGemini(descMsgs, visionImages);
+          const gr = await callGemini(descMsgs, visionImages.slice(0, 3));
           if (gr && gr.ok) {
             const gd = await gr.json();
             const desc = gd?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join(" ") || "";
-            if (desc && desc.length > 20) {
-              prompt = (prompt + ", " + desc).slice(0, 850);
-            }
+            if (desc && desc.length > 20) fallbackPrompt = enhanceImagePrompt((prompt + ", reference details: " + desc).slice(0, 2500), true);
           }
         } catch (e) {
-          console.log("vision ref for image gen failed", e.message);
+          console.log("vision fallback description failed", e.message);
         }
       }
 
       // 1) Gemini image (best reliability / quality on free tier)
       try {
-        const gemImg = await callGeminiImage(prompt);
+        const gemImg = await callGeminiImage(prompt, hasVision ? visionImages : []);
         if (gemImg && gemImg.dataUrl) {
           console.log("Image gen via Gemini:", gemImg.model);
-          const content =
-            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
-            "![Generated image](" + gemImg.dataUrl + ")\n\n" +
-            "_(Gemini · tap to enlarge)_";
+          const content = "Here is the image I generated based on your request.";
           return res.json({
             choices: [{ message: { content } }],
             reply: content,
             image_url: gemImg.dataUrl,
+            image_mime_type: gemImg.dataUrl.split(';')[0].replace('data:', ''),
             prompt_used: prompt,
-            tool: "gemini-image"
+            tool: "gemini-image",
+            image_profile: imageProfileForPrompt(prompt)
           });
         }
       } catch (e) {
@@ -1685,19 +1730,18 @@ app.post("/chat", async (req, res) => {
 
       // 2) Hugging Face (FLUX etc.)
       try {
-        const hfImg = await callHuggingFaceImage(prompt);
+        const hfImg = await callHuggingFaceImage(fallbackPrompt);
         if (hfImg && hfImg.dataUrl) {
           console.log("Image gen via HuggingFace:", hfImg.model);
-          const content =
-            "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
-            "![Generated image](" + hfImg.dataUrl + ")\n\n" +
-            "_(Hugging Face · tap to enlarge)_";
+          const content = "Here is the image I generated based on your request.";
           return res.json({
             choices: [{ message: { content } }],
             reply: content,
             image_url: hfImg.dataUrl,
-            prompt_used: prompt,
-            tool: "huggingface"
+            image_mime_type: hfImg.dataUrl.split(';')[0].replace('data:', ''),
+            prompt_used: fallbackPrompt,
+            tool: "huggingface",
+            image_profile: imageProfileForPrompt(fallbackPrompt)
           });
         }
       } catch (e) {
@@ -1707,16 +1751,15 @@ app.post("/chat", async (req, res) => {
       // 3) Pollinations last fallback
       const url = pollinationsUrl(prompt);
       console.log("Image gen via Pollinations:", prompt.slice(0, 120));
-      const content =
-        "Here is a generated image for: **" + prompt.slice(0, 140) + "**\n\n" +
-        "![Generated image](" + url + ")\n\n" +
-        "_(Tap image to enlarge · Download below · free fallback)_";
+      const content = "Here is the image I generated based on your request.";
       return res.json({
         choices: [{ message: { content } }],
         reply: content,
         image_url: url,
-        prompt_used: prompt,
-        tool: "pollinations"
+        image_mime_type: "image/jpeg",
+        prompt_used: fallbackPrompt,
+        tool: "pollinations",
+        image_profile: imageProfileForPrompt(fallbackPrompt)
       });
     }
 
@@ -1994,7 +2037,7 @@ app.post("/image-search", async (req, res) => {
 });
 
 console.log("📌 Serper keys:", SERPER_KEYS.length, "| Firecrawl:", FIRECRAWL_KEYS.length, "| Parallel:", PARALLEL_KEYS.length);
-console.log("📌 Image gen order: Gemini → HuggingFace → Pollinations (Puter = client fallback)");
+console.log("📌 Image gen order: Gemini 3.1 Flash Image → HF Qwen-Image → HF FLUX.1-Krea-dev → HF SD3.5 → Pollinations");
 console.log("📌 Image search: Serper Images + Wikimedia fallback");
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
