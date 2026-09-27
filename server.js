@@ -600,6 +600,13 @@ async function callGeminiImage(prompt, referenceImages = []) {
 
         if (!response.ok) {
           console.log(`Gemini image key ${i + 1}/${GEMINI_KEYS.length} ${model} -> ${response.status}: ${raw.slice(0, 700)}`);
+          if (response.status === 429) {
+            const quotaZero = /limit:\s*0\s+(?:requests per day|input tokens per minute)|project has exceeded a quota|too_many_requests/i.test(raw);
+            if (quotaZero) {
+              console.log('Gemini image quota is exhausted for this request/project; stopping Gemini image retries and moving to HF.');
+              break;
+            }
+          }
           continue;
         }
 
@@ -642,21 +649,42 @@ async function callGeminiImage(prompt, referenceImages = []) {
 
 async function callHuggingFaceImage(prompt) {
   if (!HUGGINGFACE_KEYS.length) return null;
-  const text = String(prompt || '').trim().slice(0, 2600);
+  const text = String(prompt || '').trim().slice(0, 3000);
+  if (!text) return null;
   const profile = imageProfileForPrompt(text);
+  // Keep HF dimensions inside the common 1024px generation envelope while
+  // preserving the requested aspect ratio. This avoids provider-specific
+  // size rejection on portrait/poster/landscape requests.
+  const hfScale = Math.min(1, 1024 / profile.width, 1024 / profile.height);
+  const hfWidth = Math.max(512, Math.floor((profile.width * hfScale) / 64) * 64);
+  const hfHeight = Math.max(512, Math.floor((profile.height * hfScale) / 64) * 64);
 
-  // Current HF text-to-image candidates. FLUX.1-schnell is intentionally removed
-  // from this route because the previous router request returned HTTP 410.
+  // IMPORTANT: the previous V2 route forced newer models through the
+  // "hf-inference" provider even though those models are not served by that
+  // provider. That produced HTTP 400 "Model not supported by provider".
+  // Use models that are actually supported by the hf-inference text-to-image
+  // route. We keep this list conservative so a model/provider change upstream
+  // cannot break the whole fallback chain.
   const models = [
-    { id: 'Qwen/Qwen-Image', steps: 40, guidance: 4.0 },
-    { id: 'black-forest-labs/FLUX.1-Krea-dev', steps: 28, guidance: 4.5 },
-    { id: 'stabilityai/stable-diffusion-3.5-medium', steps: 30, guidance: 5.0 }
+    {
+      id: 'stabilityai/stable-diffusion-3-medium-diffusers',
+      steps: 32,
+      guidance: 6.5
+    },
+    {
+      id: 'stabilityai/stable-diffusion-xl-base-1.0',
+      steps: 28,
+      guidance: 7.0
+    }
   ];
 
   const negativePrompt = [
-    'blurry', 'low quality', 'low resolution', 'distorted anatomy', 'deformed',
-    'extra limbs', 'duplicate objects', 'bad proportions', 'random text',
-    'watermark', 'logo', 'signature', 'cropped subject'
+    'blurry', 'low quality', 'low resolution', 'poor detail',
+    'distorted anatomy', 'deformed anatomy', 'bad proportions',
+    'extra limbs', 'duplicate objects', 'extra fingers',
+    'cropped subject', 'out of frame', 'random text',
+    'misspelled text', 'watermark', 'logo', 'signature',
+    'artifacts', 'jpeg artifacts'
   ].join(', ');
 
   async function tryUrl(url, key, label, settings) {
@@ -673,11 +701,11 @@ async function callHuggingFaceImage(prompt) {
           num_inference_steps: settings.steps,
           guidance_scale: settings.guidance,
           negative_prompt: negativePrompt,
-          width: profile.width,
-          height: profile.height
+          width: hfWidth,
+          height: hfHeight
         }
       }),
-      signal: AbortSignal.timeout(120000)
+      signal: AbortSignal.timeout(150000)
     });
 
     const raw = await response.arrayBuffer();
@@ -685,31 +713,57 @@ async function callHuggingFaceImage(prompt) {
 
     if (!response.ok) {
       const errText = Buffer.from(raw).toString('utf8');
-      console.log(`HF image ${label} -> ${response.status}: ${errText.slice(0, 700)}`);
+      console.log(`HF image ${label} -> ${response.status}: ${errText.slice(0, 900)}`);
       return null;
     }
 
-    if (ctype.includes('application/json')) {
-      const jsonText = Buffer.from(raw).toString('utf8');
-      let j;
-      try { j = JSON.parse(jsonText); } catch { j = null; }
-      if (j?.image) return { dataUrl: 'data:image/png;base64,' + j.image, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
-      if (Array.isArray(j?.images) && j.images[0]) {
-        const b = String(j.images[0]).replace(/^data:image\/\w+;base64,/, '');
-        return { dataUrl: 'data:image/png;base64,' + b, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
+    // Successful text-to-image responses are normally raw image bytes.
+    if (!ctype.includes('application/json')) {
+      const buf = Buffer.from(raw);
+      if (buf.length < 5000) {
+        console.log(`HF image ${label}: image response too small (${buf.length} bytes)`);
+        return null;
       }
-      console.log(`HF image ${label}: JSON response without image`);
-      return null;
+      const mime = ctype.split(';')[0] || 'image/png';
+      if (!/^image\//i.test(mime)) {
+        console.log(`HF image ${label}: unexpected success content-type ${mime}`);
+        return null;
+      }
+      return {
+        dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+        model: label,
+        provider: 'huggingface',
+        aspectRatio: profile.aspectRatio
+      };
     }
 
-    const buf = Buffer.from(raw);
-    if (buf.length < 500) {
-      console.log(`HF image ${label}: image response too small (${buf.length} bytes)`);
-      return null;
+    // Error/queue responses can be JSON. Do not accidentally treat arbitrary
+    // JSON as an image. Some providers may return a data URL or image field.
+    const jsonText = Buffer.from(raw).toString('utf8');
+    let j = null;
+    try { j = JSON.parse(jsonText); } catch (_) {}
+
+    if (j?.image && typeof j.image === 'string') {
+      const b = j.image.replace(/^data:image\/[^;]+;base64,/, '');
+      return {
+        dataUrl: 'data:image/png;base64,' + b,
+        model: label,
+        provider: 'huggingface',
+        aspectRatio: profile.aspectRatio
+      };
+    }
+    if (Array.isArray(j?.images) && typeof j.images[0] === 'string') {
+      const b = j.images[0].replace(/^data:image\/[^;]+;base64,/, '');
+      return {
+        dataUrl: 'data:image/png;base64,' + b,
+        model: label,
+        provider: 'huggingface',
+        aspectRatio: profile.aspectRatio
+      };
     }
 
-    const mime = ctype.split(';')[0] || 'image/png';
-    return { dataUrl: `data:${mime};base64,${buf.toString('base64')}`, model: label, provider: 'huggingface', aspectRatio: profile.aspectRatio };
+    console.log(`HF image ${label}: successful HTTP response contained no image`);
+    return null;
   }
 
   for (let k = 0; k < HUGGINGFACE_KEYS.length; k++) {
@@ -732,10 +786,9 @@ async function callHuggingFaceImage(prompt) {
     }
   }
 
-  console.log('Hugging Face image: all configured keys/models failed; moving to Pollinations fallback');
+  console.log('Hugging Face image: all supported hf-inference models/keys failed; moving to Pollinations fallback');
   return null;
 }
-
 
 /** Reference / search images (carousel) — NOT AI generation */
 function needsReferenceImages(text) {
@@ -1686,7 +1739,9 @@ app.post("/chat", async (req, res) => {
         .replace(/!\[Generated image\][\s\S]*/gi, "")
         .trim();
       let prompt = extractImagePrompt(cleanUser || lastUserText);
-      console.log("Image prompt (" + prompt.length + " chars):", prompt.slice(0, 220));
+      const referenceRequested = hasVision || /\b(edit|editing|modify|change|replace|remove|add|retouch|recolor|restyle|transform|based on this image|use this image|from this image)\b/i.test(cleanUser || lastUserText);
+      prompt = enhanceImagePrompt(prompt, referenceRequested);
+      console.log("Enhanced image prompt (" + prompt.length + " chars):", prompt.slice(0, 260));
 
       // If a reference image is attached, Gemini gets the actual pixels for true
       // edit/reference generation. HF/Pollinations remain text-only fallbacks.
@@ -1708,7 +1763,7 @@ app.post("/chat", async (req, res) => {
         }
       }
 
-      // 1) Gemini image (best reliability / quality on free tier)
+      // 1) Gemini image (primary image generator; may be unavailable on free-tier quota)
       try {
         const gemImg = await callGeminiImage(prompt, hasVision ? visionImages : []);
         if (gemImg && gemImg.dataUrl) {
@@ -1728,7 +1783,7 @@ app.post("/chat", async (req, res) => {
         console.log("Gemini image path failed:", e.message);
       }
 
-      // 2) Hugging Face (FLUX etc.)
+      // 2) Hugging Face Inference (supported hf-inference image models)
       try {
         const hfImg = await callHuggingFaceImage(fallbackPrompt);
         if (hfImg && hfImg.dataUrl) {
@@ -2037,7 +2092,7 @@ app.post("/image-search", async (req, res) => {
 });
 
 console.log("📌 Serper keys:", SERPER_KEYS.length, "| Firecrawl:", FIRECRAWL_KEYS.length, "| Parallel:", PARALLEL_KEYS.length);
-console.log("📌 Image gen order: Gemini 3.1 Flash Image → HF Qwen-Image → HF FLUX.1-Krea-dev → HF SD3.5 → Pollinations");
+console.log("📌 Image gen order: Gemini 3.1 Flash Image → HF SD3 Medium → HF SDXL → Pollinations");
 console.log("📌 Image search: Serper Images + Wikimedia fallback");
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
