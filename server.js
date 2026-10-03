@@ -476,11 +476,11 @@ async function callDeepSeek(fullMessages) {
 // ─────────────────────────────
 // FREE WEB SEARCH (DuckDuckGo — no API key)
 // ─────────────────────────────
-function needsWebSearch(text) {
+function needsWebSearch(text, force) {
+  if (force) return true;
   const q = String(text || "").toLowerCase();
-  if (q.length < 6) return false;
-  // skip pure homework / code / definition drills
-  if (/^(write|code|html|css|python|explain simply|define|quiz me|flashcard|generate an image|draw)/i.test(q.trim())) return false;
+  if (q.length < 4) return false;
+  if (/^(write|code|html|css|python|explain simply|define|quiz me|flashcard|generate an image|draw)\b/i.test(q.trim()) && !/\b(202[4-9]|movie|news|latest)\b/i.test(q)) return false;
   const triggers = [
     /\b(today|tonight|this week|this month|yesterday|breaking|latest|current|recent|now|2024|2025|2026|2027|2028)\b/i,
     /\b(who is|who won|who are the|president of|prime minister|governor of)\b/i,
@@ -488,10 +488,10 @@ function needsWebSearch(text) {
     /\b(news|headline|score|match result|exchange rate|price of|stock)\b/i,
     /\b(when is|what time is|schedule for|jamb|waec|neco|post.?utme)\b/i,
     /\b(weather in|temperature in)\b/i,
-    /\bsearch (the )?(web|online|internet)\b/i,
+    /\b(search (the )?(web|online|internet)|online search|do an online|live search|google it)\b/i,
     /\blook up\b/i,
-    /\b(movie|film|trailer|box office|cast of|released|premiere)\b/i,
-    /\b(marvel|spider-?man|avengers|disney)\b/i,
+    /\b(movie|film|trailer|box office|cast of|released|premiere|doomsday)\b/i,
+    /\b(marvel|spider-?man|avengers|disney|mcu|dr\.?\s*doom|tony stark)\b/i,
     /\b(summarise|summarize).{0,40}\b(movie|film|news)\b/i
   ];
   return triggers.some((re) => re.test(q));
@@ -1846,7 +1846,8 @@ app.post("/chat", async (req, res) => {
 
 
 // ── FREE WEB SEARCH when query looks time-sensitive ──
-    if (needsWebSearch(lastUserText) && !hasVision) {
+    const forceSearch = !!(req.body && (req.body.forceSearch || req.body.force_search));
+    if ((needsWebSearch(lastUserText, forceSearch) || forceSearch) && !hasVision) {
       const antiHallucinate =
         "ANTI-HALLUCINATION RULES (mandatory):\n" +
         "1) Do NOT invent ranked lists, box-office tables, or exact dollar figures unless those numbers appear in the LIVE SEARCH text below.\n" +
@@ -2170,3 +2171,13 @@ app.listen(PORT, () => {
   console.log(`📌 HuggingFace keys: ${HUGGINGFACE_KEYS.length}`);
   console.log(`📌 DeepSeek keys: ${DEEPSEEK_KEYS.length} — model: ${DEEPSEEK_MODEL}`);
 });
+
+
+/* Nova usage logging (optional Firebase Admin):
+ * After a successful Nova reply, increment:
+ *   admin.firestore().collection("nova_usage").doc(yyyy-mm-dd).set({
+ *     count: admin.firestore.FieldValue.increment(1),
+ *     updatedAt: admin.firestore.FieldValue.serverTimestamp()
+ *   }, { merge: true });
+ * Requires FIREBASE_SERVICE_ACCOUNT on Render.
+ */
