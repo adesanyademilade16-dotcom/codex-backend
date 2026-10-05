@@ -272,6 +272,30 @@ async function callGroq(key, fullMessages) {
 // GEMINI CALL
 // 15 keys × 2 models = 30 combos — never bails early on any error
 // ─────────────────────────────
+
+async function hydrateVisionImages(images) {
+  const out = [];
+  for (const img of (images || []).slice(0, 4)) {
+    if (!img) continue;
+    if (img.data && img.mimeType) {
+      out.push({ mimeType: img.mimeType, data: img.data, name: img.name });
+      continue;
+    }
+    const url = typeof img === "string" ? img : (img.url || img.imageUrl || "");
+    if (!url || !/^https?:\/\//i.test(url)) continue;
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      const mime = r.headers.get("content-type") || "image/jpeg";
+      out.push({ mimeType: mime.split(";")[0], data: buf.toString("base64"), name: img.name || "image" });
+    } catch (e) {
+      console.log("hydrate vision url fail", e.message);
+    }
+  }
+  return out;
+}
+
 async function callGemini(fullMessages, images = []) {
   const systemMsg = fullMessages.find(m => m.role === "system");
   const turns = fullMessages
@@ -1698,7 +1722,7 @@ app.post("/chat", async (req, res) => {
       ? [{ role: "system", content: system }, ...messages]
       : messages;
 
-    let visionImages = Array.isArray(images) ? images.filter(x => x && x.data && x.mimeType).slice(0, 4) : [];
+    let visionImages = await hydrateVisionImages(Array.isArray(images) ? images : []);
     let hasVision = visionImages.length > 0;
 
     // Latest user text
