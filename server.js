@@ -1268,15 +1268,60 @@ async function wikimediaImageSearch(query, limit = 6) {
   return out;
 }
 
+/** Actually probe a candidate image URL rather than trusting search metadata.
+ *  Many hotlinked results 404, sit behind hotlink-protection, or have expired —
+ *  those render as a broken-image icon client-side. We check that before
+ *  ever handing the URL to the student. */
+async function urlLooksAlive(url, timeoutMs = 3500) {
+  if (!url) return false;
+  try {
+    let r = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; CodexHubBot/1.0)" },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    // Some CDNs/hosts reject HEAD (405/403) but serve the same URL fine via GET —
+    // retry with a small ranged GET before giving up on it.
+    if (!r.ok || r.status === 405) {
+      r = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+        headers: { Range: "bytes=0-4096", "User-Agent": "Mozilla/5.0 (compatible; CodexHubBot/1.0)" },
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+    }
+    if (!r.ok) return false;
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    // Some hosts omit content-type on HEAD/partial responses — don't punish those,
+    // only reject when the header is present and clearly not an image.
+    return ct === "" || ct.startsWith("image/");
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Filter a candidate list down to real, loadable images, keeping original order. */
+async function filterAliveImages(images, limit) {
+  const pool = images.slice(0, Math.max(limit * 3, limit));
+  const checks = await Promise.allSettled(
+    pool.map(async (im) => ({ im, ok: await urlLooksAlive(im.url || im.full) }))
+  );
+  const alive = [];
+  for (const c of checks) {
+    if (c.status === "fulfilled" && c.value.ok) alive.push(c.value.im);
+  }
+  return alive.slice(0, limit);
+}
+
 async function searchReferenceImages(query, limit = 6) {
   // Prefer Serper photos, fill gaps from Wikimedia (great for wildlife/educational)
-  let images = await serperImageSearch(query, limit);
+  let images = await serperImageSearch(query, limit * 2);
   let provider = images.length ? "serper" : "none";
-  if (images.length < limit) {
-    const wiki = await wikimediaImageSearch(query, limit);
+  if (images.length < limit * 2) {
+    const wiki = await wikimediaImageSearch(query, limit * 2);
     const seen = new Set(images.map((x) => x.full || x.url));
     for (const w of wiki) {
-      if (images.length >= limit) break;
       const key = w.full || w.url;
       if (key && !seen.has(key)) {
         images.push(w);
@@ -1286,7 +1331,22 @@ async function searchReferenceImages(query, limit = 6) {
     if (wiki.length && provider === "none") provider = "wikimedia";
     else if (wiki.length && provider === "serper") provider = "serper+wikimedia";
   }
-  return { query, provider, images };
+  // Probe every candidate and only keep ones that actually load — this is what
+  // stops broken-image icons from ever reaching the student.
+  let alive = await filterAliveImages(images, limit);
+  // Still short (e.g. a very narrow query)? Pull a second, wider Wikimedia batch
+  // before giving up, so the student still gets something real instead of a gap.
+  if (alive.length < Math.min(2, limit)) {
+    const more = await wikimediaImageSearch(query + " diagram", limit * 2);
+    const seen = new Set(images.map((x) => x.full || x.url));
+    const fresh = more.filter((w) => !seen.has(w.full || w.url));
+    const aliveMore = await filterAliveImages(fresh, limit - alive.length);
+    if (aliveMore.length) {
+      alive = alive.concat(aliveMore);
+      if (provider.indexOf("wikimedia") === -1) provider += "+wikimedia";
+    }
+  }
+  return { query, provider, images: alive };
 }
 
 async function firecrawlSearch(query) {
@@ -1662,16 +1722,22 @@ async function enforceNovaQuota(req, res) {
   const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : (req.body && req.body.idToken) || "";
   const cost = Math.min(4, Math.max(1, Number((req.body && req.body.quotaCost) || 1)));
 
-  // If no token, allow but mark soft (legacy clients) — prefer hard reject in production
+  // SECURITY: this endpoint burns paid/rate-limited Groq/Gemini/HF quota per
+  // call. The backend URL is public (it's right there in the client JS), so
+  // "soft allow" on a missing/invalid token used to mean anyone could call
+  // /chat directly with curl and drain the shared API keys for free, with no
+  // record of who did it. Every real caller already sends a Firebase ID
+  // token (see student-tools-core.js / nova.html) — this now hard-rejects
+  // anyone who doesn't.
   if (!idToken) {
-    console.log("quota: no id token — soft allow");
-    return { ok: true, soft: true, cost };
+    console.log("quota: no id token — rejected");
+    return { ok: false, status: 401, body: { error: "auth_required", message: "Sign in to use Nova." } };
   }
 
   const identity = await verifyFirebaseIdToken(idToken);
   if (!identity || !identity.uid) {
-    console.log("quota: invalid token");
-    return { ok: true, soft: true, cost }; // don't lock out if verify fails
+    console.log("quota: invalid token — rejected");
+    return { ok: false, status: 401, body: { error: "auth_invalid", message: "Your session expired — please sign in again." } };
   }
 
   const userDoc = await firestoreGetUser(identity.uid, idToken);
@@ -2097,6 +2163,21 @@ app.post("/chat", async (req, res) => {
 // ─────────────────────────────
 app.post("/image-gen", async (req, res) => {
   try {
+    // Same auth gate as /chat — prevent anonymous quota burn
+    try {
+      const quotaResult = await enforceNovaQuota(req, res);
+      if (quotaResult && quotaResult.ok === false) {
+        return res.status(quotaResult.status || 401).json(quotaResult.body);
+      }
+      if (quotaResult && quotaResult.used != null) {
+        res.setHeader("X-Nova-Quota-Used", String(quotaResult.used));
+        res.setHeader("X-Nova-Quota-Cap", String(quotaResult.cap || ""));
+      }
+    } catch (qe) {
+      console.log("image-gen quota error", qe.message);
+      return res.status(401).json({ error: "auth_required", message: "Sign in to generate images." });
+    }
+
     const promptRaw = String(req.body?.prompt || req.body?.q || req.body?.text || "").trim();
     if (!promptRaw || promptRaw.length < 2) {
       return res.status(400).json({ error: "prompt required" });
