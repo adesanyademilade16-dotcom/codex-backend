@@ -1,6 +1,6 @@
 {
   "name": "codex-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "firebase-admin": "^12.7.0"
   }
 }
