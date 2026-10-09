@@ -43,14 +43,28 @@ function getAdmin() {
 
 async function verifyIdToken(req) {
   const h = req.headers.authorization || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
+  let token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
+  // Fallback: some mobile browsers strip Authorization on cross-origin POST
+  if (!token && req.body && typeof req.body.idToken === "string") {
+    token = req.body.idToken.trim();
+  }
+  if (!token && req.body && typeof req.body.token === "string") {
+    token = req.body.token.trim();
+  }
   if (!token) {
-    const err = new Error("Missing Authorization Bearer token");
+    const err = new Error("Not signed in — open Login, then return and press Resend");
     err.status = 401;
     throw err;
   }
   const a = getAdmin();
-  return a.auth().verifyIdToken(token);
+  try {
+    return await a.auth().verifyIdToken(token);
+  } catch (e) {
+    console.error("verifyIdToken failed:", e.code || e.message);
+    const err = new Error("Session expired or invalid. Log in again, then Resend code.");
+    err.status = 401;
+    throw err;
+  }
 }
 
 function sixDigit() {
@@ -150,6 +164,7 @@ export function mountBrevoVerify(app) {
       });
 
       await sendBrevoEmail({ to: email, code });
+      console.log("Brevo code sent to", email.replace(/(.{2}).+(@.+)/, "$1***$2"));
       return res.json({ ok: true, expiresInSec: 180, email });
     } catch (e) {
       console.error("send-verify-code", e.message || e);
