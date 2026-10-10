@@ -20,6 +20,13 @@ const CODE_TTL_MS = 3 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_SENDS_PER_HOUR = 5;
 
+// The frontend's firebase-config.js — every ID token verifyIdToken() is ever
+// asked to check will have been issued FOR this project. If the service
+// account downloaded into FIREBASE_SERVICE_ACCOUNT belongs to a different
+// Firebase project, verifyIdToken() fails with auth/argument-error on every
+// single call, no exceptions — this is the #1 cause of "nothing happens".
+const EXPECTED_PROJECT_ID = "codex-study-hub-923c5";
+
 function getAdmin() {
   if (admin.apps.length) return admin;
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
@@ -34,6 +41,23 @@ function getAdmin() {
   }
   if (cred.private_key && typeof cred.private_key === "string") {
     cred.private_key = cred.private_key.replace(/\\n/g, "\n");
+  }
+  // Loud, impossible-to-miss startup check: this is the single most common
+  // reason this feature silently "does nothing" — the service account JSON
+  // was downloaded from the wrong Firebase project (or a fresh one created
+  // by mistake), so every verifyIdToken() call fails with auth/argument-error
+  // and the real reason never made it into the logs before this.
+  if (cred.project_id && cred.project_id !== EXPECTED_PROJECT_ID) {
+    console.error(
+      "🚨 FIREBASE_SERVICE_ACCOUNT is for project \"" + cred.project_id + "\" " +
+      "but the Codex Hub frontend issues tokens for \"" + EXPECTED_PROJECT_ID + "\". " +
+      "Every email-verification call WILL fail until you re-download the service " +
+      "account JSON from Firebase Console → Project Settings → Service accounts, " +
+      "for the \"" + EXPECTED_PROJECT_ID + "\" project specifically, and replace " +
+      "the FIREBASE_SERVICE_ACCOUNT env var on Render with it."
+    );
+  } else if (cred.project_id) {
+    console.log("✅ Brevo verify: FIREBASE_SERVICE_ACCOUNT matches project", cred.project_id);
   }
   admin.initializeApp({
     credential: admin.credential.cert(cred)
@@ -60,7 +84,11 @@ async function verifyIdToken(req) {
   try {
     return await a.auth().verifyIdToken(token);
   } catch (e) {
-    console.error("verifyIdToken failed:", e.code || e.message);
+    // Log BOTH — e.code alone ("auth/argument-error") hides the actually
+    // useful part, which is in e.message (e.g. the exact "aud" project
+    // mismatch, or "Firebase ID token has expired"). This was the gap that
+    // made the real cause invisible in the Render logs before.
+    console.error("verifyIdToken failed:", e.code || "(no code)", "—", e.message || e);
     const err = new Error("Session expired or invalid. Log in again, then Resend code.");
     err.status = 401;
     throw err;
@@ -110,13 +138,31 @@ async function sendBrevoEmail({ to, code }) {
  * @param {import('express').Express} app
  */
 export function mountBrevoVerify(app) {
-  // Health for this feature
+  // Health for this feature — visit this URL directly in a browser to
+  // self-diagnose without digging through Render logs. projectIdMatch is
+  // the one that matters most: if that's false, every send/check call will
+  // fail with auth/argument-error regardless of anything else being right.
   app.get("/auth/brevo-status", (req, res) => {
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+    let serviceAccountProjectId = null;
+    let serviceAccountJsonValid = null;
+    if (raw) {
+      try {
+        serviceAccountProjectId = JSON.parse(raw).project_id || null;
+        serviceAccountJsonValid = true;
+      } catch (e) {
+        serviceAccountJsonValid = false;
+      }
+    }
     res.json({
       ok: true,
       brevoKey: Boolean(process.env.BREVO_API_KEY),
       sender: Boolean(process.env.BREVO_SENDER_EMAIL),
-      firebaseAdmin: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
+      firebaseAdmin: Boolean(raw),
+      serviceAccountJsonValid,
+      serviceAccountProjectId,
+      expectedProjectId: EXPECTED_PROJECT_ID,
+      projectIdMatch: serviceAccountProjectId ? serviceAccountProjectId === EXPECTED_PROJECT_ID : null
     });
   });
 
