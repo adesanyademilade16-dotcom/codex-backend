@@ -1,6 +1,7 @@
- import express from "express";
+import express from "express";
 import cors from "cors";
 import { mountBrevoVerify } from "./brevo-verify-routes.js";
+import { mountPaystack } from "./paystack-routes.js";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -2196,6 +2197,12 @@ try {
   mountBrevoVerify(app);
 } catch (e) {
   console.error("Brevo verify mount failed:", e.message || e);
+}
+
+try {
+  mountPaystack(app);
+} catch (e) {
+  console.error("Paystack mount failed:", e.message || e);
 }
 
 app.listen(PORT, () => {
