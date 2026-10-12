@@ -6,6 +6,9 @@ import { mountPaystack } from "./paystack-routes.js";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Paystack webhook needs RAW body for HMAC signature (must be before express.json)
+app.use("/paystack/webhook", express.raw({ type: "application/json" }));
+
 app.use(express.json({ limit: "5mb" }));
 
 const ALLOWED_ORIGINS = [

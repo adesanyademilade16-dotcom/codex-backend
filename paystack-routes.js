@@ -216,21 +216,36 @@ export function mountPaystack(app) {
     try {
       if (!SECRET) return res.status(200).send("no secret");
       const signature = req.headers["x-paystack-signature"];
+      // Prefer raw Buffer (express.raw on /paystack/webhook). Fallback if JSON middleware ate body.
       let rawBody;
       if (Buffer.isBuffer(req.body)) rawBody = req.body;
       else if (typeof req.body === "string") rawBody = Buffer.from(req.body);
-      else rawBody = Buffer.from(JSON.stringify(req.body || {}));
-
-      const expected = crypto.createHmac("sha512", SECRET).update(rawBody).digest("hex");
-      if (
-        !signature ||
-        expected.length !== signature.length ||
-        !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)))
-      ) {
-        return res.status(401).send("bad sig");
+      else if (req.body && typeof req.body === "object") {
+        // Signature cannot be verified reliably after JSON parse — re-verify via API only.
+        rawBody = null;
+      } else {
+        rawBody = Buffer.from("");
       }
 
-      const event = JSON.parse(rawBody.toString("utf8"));
+      let event;
+      if (rawBody) {
+        const expected = crypto.createHmac("sha512", SECRET).update(rawBody).digest("hex");
+        if (
+          !signature ||
+          expected.length !== String(signature).length ||
+          !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)))
+        ) {
+          console.warn("Hub webhook bad signature");
+          return res.status(401).send("bad sig");
+        }
+        event = JSON.parse(rawBody.toString("utf8"));
+      } else {
+        // Forwarded body already parsed — still safe because we re-verify with Paystack API below.
+        event = req.body;
+        if (!event || typeof event !== "object") {
+          return res.status(200).send("no body");
+        }
+      }
       if (event.event !== "charge.success") return res.status(200).send("ignored");
 
       const reference = event.data.reference;
