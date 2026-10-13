@@ -2,12 +2,10 @@ import express from "express";
 import cors from "cors";
 import { mountBrevoVerify } from "./brevo-verify-routes.js";
 import { mountPaystack } from "./paystack-routes.js";
+import { mountFcm } from "./fcm-routes.js";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-// Paystack webhook needs RAW body for HMAC signature (must be before express.json)
-app.use("/paystack/webhook", express.raw({ type: "application/json" }));
 
 app.use(express.json({ limit: "5mb" }));
 
@@ -2206,6 +2204,12 @@ try {
   mountPaystack(app);
 } catch (e) {
   console.error("Paystack mount failed:", e.message || e);
+}
+
+try {
+  mountFcm(app);
+} catch (e) {
+  console.error("FCM mount failed:", e.message || e);
 }
 
 app.listen(PORT, () => {
