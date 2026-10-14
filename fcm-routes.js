@@ -125,7 +125,7 @@ export function mountFcm(app) {
       firebaseAdmin: Boolean(
         process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ),
-      routes: ["/push/status", "/push/notify", "/push/test"]
+      routes: ["/push/status", "/push/notify", "/push/test", "/push/on-chat-message"]
     });
   });
 
@@ -199,5 +199,69 @@ export function mountFcm(app) {
     }
   });
 
-  console.log("FCM push routes: /push/status, /push/notify, /push/test");
+  
+  // Reliable chat notify: server resolves participants + tokens
+  app.post("/push/on-chat-message", async (req, res) => {
+    try {
+      const decoded = await verifyBearer(req);
+      const body = req.body || {};
+      const convId = String(body.convId || "").trim();
+      if (!convId) return res.status(400).json({ ok: false, error: "convId required" });
+
+      const db = getAdmin().firestore();
+      const conv = await db.collection("conversations").doc(convId).get();
+      if (!conv.exists) return res.status(404).json({ ok: false, error: "conversation not found" });
+      const parts = (conv.data() && conv.data().participants) || [];
+      if (!Array.isArray(parts) || !parts.includes(decoded.uid)) {
+        return res.status(403).json({ ok: false, error: "not a participant" });
+      }
+
+      const title = String(body.title || "New message").slice(0, 100);
+      const msgBody = String(body.body || body.preview || "Open Codex Hub to read").slice(0, 250);
+      const url =
+        body.url ||
+        "https://codex-hub-prime.vercel.app/app/chats.html";
+
+      let totalSent = 0;
+      let totalFailed = 0;
+      const recipients = parts.filter((u) => u && u !== decoded.uid);
+
+      for (const toUid of recipients) {
+        const tokens = await tokensForUid(toUid);
+        if (!tokens.length) continue;
+        // Respect recipient preference when set
+        try {
+          const u = await db.collection("users").doc(toUid).get();
+          if (u.exists && u.data().pushEnabled === false) continue;
+        } catch (e) {}
+        const result = await sendToTokens(tokens, {
+          title,
+          body: msgBody,
+          url,
+          tag: "chat-" + convId,
+          type: "chat_message"
+        });
+        totalSent += result.sent || 0;
+        totalFailed += result.failed || 0;
+        if (result.invalid && result.invalid.length) {
+          try {
+            await pruneInvalid(toUid, result.invalid);
+          } catch (e) {}
+        }
+      }
+
+      res.json({
+        ok: true,
+        recipients: recipients.length,
+        sent: totalSent,
+        failed: totalFailed
+      });
+    } catch (e) {
+      const status = e.status || 500;
+      console.error("push/on-chat-message", e.message || e);
+      res.status(status).json({ ok: false, error: e.message || "push failed" });
+    }
+  });
+
+  console.log("FCM push routes: /push/status, /push/notify, /push/test, /push/on-chat-message");
 }
