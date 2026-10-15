@@ -2,6 +2,14 @@ import express from "express";
 import cors from "cors";
 import { mountBrevoVerify } from "./brevo-verify-routes.js";
 import { mountPaystack } from "./paystack-routes.js";
+import {
+  TAVILY_KEYS,
+  tavilyWebSearchLines,
+  tavilyImageSearch,
+  needsReferenceImagesSmart,
+  extractReferenceQuerySmart,
+  searchReferenceImagesWithTavily
+} from "./tavily-search.js";
 import { mountFcm } from "./fcm-routes.js";
 
 const app = express();
@@ -229,7 +237,7 @@ app.get("/", (req, res) => {
     parallel_keys: PARALLEL_KEYS.length,
     tools: {
       web_search: "serper+firecrawl+parallel+searxng+ddg+wiki+cache",
-      image_search: "serper-images+wikimedia",
+      image_search: "tavily→serper-images→wikimedia",
       image_gen: "gemini→hf-sd3→hf-sdxl→pollinations",
       vision: "gemini",
       coding_models: OPENROUTER_MODELS,
@@ -825,28 +833,34 @@ async function callHuggingFaceImage(prompt) {
 
 /** Reference / search images (carousel) — NOT AI generation */
 function needsReferenceImages(text) {
+  try {
+    if (typeof needsReferenceImagesSmart === "function") return needsReferenceImagesSmart(text);
+  } catch (e) {}
   const q = String(text || "").toLowerCase();
   if (/\b(generate|create|draw|paint|illustrate|make me)\b.*\b(image|picture|art|logo)\b/i.test(q) &&
-      !/\b(search|online|web|google|reference|find|look\s*up)\b/i.test(q)) {
+      !/\b(search|online|web|google|reference|find|look\s*up|labelled|diagram)\b/i.test(q)) {
     return false;
   }
   return (
     /\b(show|find|search|look\s*up|bring|reference)\b.{0,50}\b(image|images|picture|pictures|photo|photos|diagram|diagrams)\b/i.test(q) ||
-    (/\b(image|images|picture|pictures|photo|photos)\b.{0,40}\b(of|for|about)\b/i.test(q) &&
-      /\b(search|online|web|google|reference|find|look\s*up)\b/i.test(q)) ||
     /\blabelled?\s+diagram\b|\banatomy\s+diagram\b|\btextbook\s+figure\b/i.test(q) ||
+    /\b(who\s+is|who'?s)\b/i.test(q) ||
     (/\b(sea\s+animals?|animals?|species)\b/i.test(q) && /\b(image|images|picture|pictures|photo|photos)\b/i.test(q))
   );
 }
 
 function extractReferenceQuery(text) {
+  try {
+    if (typeof extractReferenceQuerySmart === "function") return extractReferenceQuerySmart(text);
+  } catch (e) {}
   const t = String(text || "").trim();
   let m = t.match(/(?:images?|pictures?|photos?|diagrams?|references?)\s+(?:of|for|about|on)\s+(.+)$/i);
   if (m) return m[1].replace(/[?.!].*$/, "").trim().slice(0, 100);
-  m = t.match(/(?:search|look\s*up|find|show)\s+(?:online\s+)?(?:for\s+)?(.+?)(?:\s+and\s+bring|\s+with\s+images?|\s+images?|\s+pictures?)?$/i);
+  m = t.match(/(?:who(?:'s| is)|what is)\s+(.+)$/i);
   if (m) return m[1].replace(/[?.!].*$/, "").trim().slice(0, 100);
   return t.replace(/\b(please|online|search|images?|pictures?|photos?|reference|bring|show|me|and)\b/gi, " ").replace(/\s+/g, " ").trim().slice(0, 100);
 }
+
 
 function needsImageGen(text, hasVision = false) {
   const q = String(text || '').toLowerCase();
@@ -1133,6 +1147,15 @@ async function searxSearch(query) {
 
 async function serperSearch(query) {
   const lines = [];
+  // Tavily first for news/research quality
+  try {
+    if (typeof tavilyWebSearchLines === "function" && TAVILY_KEYS && TAVILY_KEYS.length) {
+      const tv = await tavilyWebSearchLines(query);
+      if (tv && tv.length) return tv;
+    }
+  } catch (e) {
+    console.log("Tavily web fallback to Serper:", e.message || e);
+  }
   for (const key of SERPER_KEYS) {
     try {
       const r = await fetch("https://google.serper.dev/search", {
@@ -1278,25 +1301,63 @@ async function wikimediaImageSearch(query, limit = 6) {
 }
 
 async function searchReferenceImages(query, limit = 6) {
-  // Prefer Serper photos, fill gaps from Wikimedia (great for wildlife/educational)
-  let images = await serperImageSearch(query, limit);
-  let provider = images.length ? "serper" : "none";
-  if (images.length < limit) {
-    const wiki = await wikimediaImageSearch(query, limit);
-    const seen = new Set(images.map((x) => x.full || x.url));
-    for (const w of wiki) {
-      if (images.length >= limit) break;
-      const key = w.full || w.url;
-      if (key && !seen.has(key)) {
-        images.push(w);
-        seen.add(key);
-      }
+  // 1) Tavily first (best topical images + descriptions)
+  let images = [];
+  let provider = "none";
+  try {
+    if (typeof tavilyImageSearch === "function" && TAVILY_KEYS && TAVILY_KEYS.length) {
+      images = await tavilyImageSearch(query, limit);
+      if (images.length) provider = "tavily";
+    } else if (typeof searchReferenceImagesWithTavily === "function") {
+      const tv = await searchReferenceImagesWithTavily(query, limit);
+      images = tv.images || [];
+      if (images.length) provider = tv.provider || "tavily";
     }
-    if (wiki.length && provider === "none") provider = "wikimedia";
-    else if (wiki.length && provider === "serper") provider = "serper+wikimedia";
+  } catch (e) {
+    console.log("Tavily image path failed:", e.message || e);
   }
+
+  // 2) Serper fill
+  if (images.length < limit) {
+    try {
+      const serper = await serperImageSearch(query, limit);
+      const seen = new Set(images.map((x) => x.full || x.url));
+      for (const s of serper) {
+        if (images.length >= limit) break;
+        const key = s.full || s.url;
+        if (key && !seen.has(key)) {
+          images.push(s);
+          seen.add(key);
+        }
+      }
+      if (serper.length && provider === "none") provider = "serper";
+      else if (serper.length && provider === "tavily") provider = "tavily+serper";
+    } catch (e) {
+      console.log("Serper image fill failed:", e.message || e);
+    }
+  }
+
+  // 3) Wikimedia educational fallback
+  if (images.length < limit) {
+    try {
+      const wiki = await wikimediaImageSearch(query, limit);
+      const seen = new Set(images.map((x) => x.full || x.url));
+      for (const w of wiki) {
+        if (images.length >= limit) break;
+        const key = w.full || w.url;
+        if (key && !seen.has(key)) {
+          images.push(w);
+          seen.add(key);
+        }
+      }
+      if (wiki.length && provider === "none") provider = "wikimedia";
+      else if (wiki.length) provider = provider + "+wikimedia";
+    } catch (e) {}
+  }
+
   return { query, provider, images };
 }
+
 
 async function firecrawlSearch(query) {
   const lines = [];
@@ -2191,6 +2252,7 @@ app.post("/image-search", async (req, res) => {
   }
 });
 
+try { console.log("📌 Tavily keys:", typeof TAVILY_KEYS !== "undefined" ? TAVILY_KEYS.length : 0); } catch (e) {}
 console.log("📌 Serper keys:", SERPER_KEYS.length, "| Firecrawl:", FIRECRAWL_KEYS.length, "| Parallel:", PARALLEL_KEYS.length);
 console.log("📌 Image gen order: Gemini 3.1 Flash Image → HF SD3 Medium → HF SDXL → Pollinations");
 console.log("📌 Image search: Serper Images + Wikimedia fallback");
@@ -2211,6 +2273,21 @@ try {
 } catch (e) {
   console.error("FCM mount failed:", e.message || e);
 }
+
+
+// Explicit image search for tools (diagram maker, Nova carousel)
+app.post("/search/images", async (req, res) => {
+  try {
+    const q = String((req.body && (req.body.query || req.body.q)) || "").trim().slice(0, 200);
+    const limit = Math.min(12, Math.max(1, Number(req.body && req.body.limit) || 6));
+    if (!q) return res.status(400).json({ ok: false, error: "query required" });
+    const result = await searchReferenceImages(q, limit);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error("/search/images", e.message || e);
+    res.status(500).json({ ok: false, error: e.message || "search failed" });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
