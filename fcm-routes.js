@@ -125,7 +125,7 @@ export function mountFcm(app) {
       firebaseAdmin: Boolean(
         process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON
       ),
-      routes: ["/push/status", "/push/notify", "/push/test", "/push/on-chat-message"]
+      routes: ["/push/status", "/push/notify", "/push/test", "/push/on-chat-message", "/push/broadcast"]
     });
   });
 
@@ -260,6 +260,54 @@ export function mountFcm(app) {
       const status = e.status || 500;
       console.error("push/on-chat-message", e.message || e);
       res.status(status).json({ ok: false, error: e.message || "push failed" });
+    }
+  });
+
+  
+  // Admin/system broadcast (announcements, updates) — requires auth; optional admin claim soft-check
+  app.post("/push/broadcast", async (req, res) => {
+    try {
+      const decoded = await verifyBearer(req);
+      const body = req.body || {};
+      const title = String(body.title || "Codex Hub").slice(0, 100);
+      const msgBody = String(body.body || "").slice(0, 250);
+      const url = body.url || "https://codex-hub-prime.vercel.app/app/home.html";
+      const type = String(body.type || "announcement");
+      const db = getAdmin().firestore();
+
+      // Soft admin check via users/{uid}.role or isAdmin
+      let isAdmin = false;
+      try {
+        const u = await db.collection("users").doc(decoded.uid).get();
+        const d = u.exists ? u.data() : {};
+        isAdmin = !!(d.isAdmin || d.role === "admin" || d.admin === true);
+      } catch (e) {}
+      if (!isAdmin) {
+        return res.status(403).json({ ok: false, error: "admin only" });
+      }
+
+      // Collect tokens (cap for safety on free tier)
+      const snap = await db.collection("users").where("pushEnabled", "==", true).limit(500).get();
+      let sent = 0, failed = 0, targets = 0;
+      for (const doc of snap.docs) {
+        const tokens = await tokensForUid(doc.id);
+        if (!tokens.length) continue;
+        targets++;
+        const result = await sendToTokens(tokens, {
+          title,
+          body: msgBody,
+          url,
+          tag: type,
+          type
+        });
+        sent += result.sent || 0;
+        failed += result.failed || 0;
+      }
+      res.json({ ok: true, targets, sent, failed });
+    } catch (e) {
+      const status = e.status || 500;
+      console.error("push/broadcast", e.message || e);
+      res.status(status).json({ ok: false, error: e.message || "broadcast failed" });
     }
   });
 
