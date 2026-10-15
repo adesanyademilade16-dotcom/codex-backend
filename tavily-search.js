@@ -26,24 +26,34 @@ export const TAVILY_KEYS = [
 async function tavilyRequest(body) {
   let lastErr = null;
   for (const key of TAVILY_KEYS) {
-    try {
-      const r = await fetchFn("https://api.tavily.com/search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + key
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(18000)
-      });
-      if (!r.ok) {
-        const tx = await r.text().catch(() => "");
-        lastErr = new Error("tavily_" + r.status + " " + tx.slice(0, 120));
-        continue;
+    // Try Authorization Bearer first, then api_key in body (both valid per Tavily docs)
+    const attempts = [
+      {
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+        body: { ...body }
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        body: { ...body, api_key: key }
       }
-      return await r.json();
-    } catch (e) {
-      lastErr = e;
+    ];
+    for (const att of attempts) {
+      try {
+        const r = await fetchFn("https://api.tavily.com/search", {
+          method: "POST",
+          headers: att.headers,
+          body: JSON.stringify(att.body),
+          signal: AbortSignal.timeout(18000)
+        });
+        if (!r.ok) {
+          const tx = await r.text().catch(() => "");
+          lastErr = new Error("tavily_" + r.status + " " + tx.slice(0, 120));
+          continue;
+        }
+        return await r.json();
+      } catch (e) {
+        lastErr = e;
+      }
     }
   }
   if (lastErr) throw lastErr;
@@ -121,8 +131,13 @@ export async function tavilyImageSearch(query, limit = 6) {
   const out = [];
   if (!TAVILY_KEYS.length) return out;
   try {
+    // Enrich short/ambiguous queries so Tavily does not return film posters etc.
+    let q = String(query || "").trim().slice(0, 280);
+    if (q && !/\b(photo|image|picture|portrait)\b/i.test(q)) {
+      q = q + " official photo portrait";
+    }
     const data = await tavilyRequest({
-      query: String(query || "").slice(0, 300),
+      query: q,
       search_depth: "basic",
       max_results: Math.min(10, Math.max(5, limit)),
       include_images: true,

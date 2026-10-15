@@ -1307,7 +1307,7 @@ async function searchReferenceImages(query, limit = 6) {
   try {
     if (typeof tavilyImageSearch === "function" && TAVILY_KEYS && TAVILY_KEYS.length) {
       images = await tavilyImageSearch(query, limit);
-      if (images.length) provider = "tavily";
+      if (images.length) { provider = "tavily"; console.log("Tavily images used:", images.length); } else { console.log("Tavily images empty — falling back to Serper/Wikimedia"); }
     } else if (typeof searchReferenceImagesWithTavily === "function") {
       const tv = await searchReferenceImagesWithTavily(query, limit);
       images = tv.images || [];
