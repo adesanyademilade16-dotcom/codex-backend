@@ -70,19 +70,22 @@ async function sendToTokens(tokens, { title, body, url, tag, type, data }) {
       body: String(body || "").slice(0, 250)
     },
     data: {
-      url: String(url || "/app/chats.html"),
+      url: safeUrl(url),
       tag: String(tag || "codex"),
       type: String(type || "generic"),
       ...(data || {})
     },
     webpush: {
       fcmOptions: {
-        link: String(url || "https://codex-hub-prime.vercel.app/app/chats.html")
+        link: safeUrl(url)
       },
       notification: {
         icon: "https://codex-hub-prime.vercel.app/assets/icons/icon-192.png",
-        badge: "https://codex-hub-prime.vercel.app/assets/icons/icon-192.png"
-      }
+        badge: "https://codex-hub-prime.vercel.app/assets/icons/icon-192.png",
+        tag: String(tag || "codex"),
+        renotify: true
+      },
+      headers: { Urgency: "high", TTL: "86400" }
     }
   };
 
@@ -118,6 +121,57 @@ async function pruneInvalid(uid, invalid) {
   );
 }
 
+
+const HUB_ORIGIN = "https://codex-hub-prime.vercel.app";
+/** Only allow notification links inside Codex Hub (stops phishing links in pushes) */
+function safeUrl(u, fallback) {
+  const fb = fallback || HUB_ORIGIN + "/chats";
+  try {
+    const s = String(u || "").trim();
+    if (!s) return fb;
+    if (s.startsWith("/")) return HUB_ORIGIN + s;
+    const parsed = new URL(s);
+    if (parsed.origin === HUB_ORIGIN) return parsed.toString();
+  } catch (e) {}
+  return fb;
+}
+
+async function isHubAdmin(decoded) {
+  if (String(decoded.email || "").toLowerCase() === "codexhub16@gmail.com" && decoded.email_verified !== false) return true;
+  try {
+    const a = await getAdmin().firestore().collection("admins").doc(decoded.uid).get();
+    return a.exists && (a.data() || {}).active !== false;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Sender may only ping someone they share a conversation / friendship with */
+async function canPing(fromUid, toUid) {
+  const db = getAdmin().firestore();
+  try {
+    const f = await db.collection("friendships").doc(fromUid).collection("friends").doc(toUid).get();
+    if (f.exists) return true;
+  } catch (e) {}
+  try {
+    const q = await db.collection("conversations").where("participants", "array-contains", fromUid).limit(200).get();
+    return q.docs.some((d) => ((d.data() || {}).participants || []).includes(toUid));
+  } catch (e) {
+    return false;
+  }
+}
+
+// simple per-sender rate limit (memory) — 30 pushes / minute
+const _pushHits = new Map();
+function rateOk(uid, max = 30) {
+  const now = Date.now();
+  const arr = (_pushHits.get(uid) || []).filter((t) => now - t < 60000);
+  if (arr.length >= max) return false;
+  arr.push(now);
+  _pushHits.set(uid, arr);
+  return true;
+}
+
 export function mountFcm(app) {
   app.get("/push/status", (_req, res) => {
     res.json({
@@ -140,8 +194,13 @@ export function mountFcm(app) {
         // allow self only for test route
       }
 
-      const title = body.title || "Codex Hub";
-      const msgBody = body.body || "New notification";
+      if (!rateOk(decoded.uid)) return res.status(429).json({ ok: false, error: "slow down" });
+      const admin = await isHubAdmin(decoded);
+      if (toUid !== decoded.uid && !admin && !(await canPing(decoded.uid, toUid))) {
+        return res.status(403).json({ ok: false, error: "You can only notify your chats/friends" });
+      }
+      const title = String(body.title || "Codex Hub").slice(0, 100);
+      const msgBody = String(body.body || "New notification").slice(0, 250);
       const url = body.url || "https://codex-hub-prime.vercel.app/app/chats.html";
       const tag = body.tag || body.type || "codex";
       const type = body.type || "generic";
@@ -216,6 +275,7 @@ export function mountFcm(app) {
         return res.status(403).json({ ok: false, error: "not a participant" });
       }
 
+      if (!rateOk(decoded.uid, 60)) return res.status(429).json({ ok: false, error: "slow down" });
       const title = String(body.title || "New message").slice(0, 100);
       const msgBody = String(body.body || body.preview || "Open Codex Hub to read").slice(0, 250);
       const url =
@@ -275,13 +335,8 @@ export function mountFcm(app) {
       const type = String(body.type || "announcement");
       const db = getAdmin().firestore();
 
-      // Soft admin check via users/{uid}.role or isAdmin
-      let isAdmin = false;
-      try {
-        const u = await db.collection("users").doc(decoded.uid).get();
-        const d = u.exists ? u.data() : {};
-        isAdmin = !!(d.isAdmin || d.role === "admin" || d.admin === true);
-      } catch (e) {}
+      // Admin = admins/{uid} (rules-protected) or owner email. users.isAdmin is NOT trusted.
+      const isAdmin = await isHubAdmin(decoded);
       if (!isAdmin) {
         return res.status(403).json({ ok: false, error: "admin only" });
       }

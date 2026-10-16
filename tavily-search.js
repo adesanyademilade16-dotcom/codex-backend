@@ -60,31 +60,28 @@ async function tavilyRequest(body) {
   throw new Error("no_tavily_keys");
 }
 
-/** Probe URL quickly — filter hotlink-blocked / dead images */
+const BROWSER_UA =
+  "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
+
+/** Probe URL quickly — must really be an image (not an HTML page / tiny pixel / dead link) */
 export async function probeImageUrl(url, timeoutMs = 4500) {
   if (!url || !/^https?:\/\//i.test(url)) return false;
   try {
     const r = await fetchFn(url, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { "User-Agent": "CodexHubImageProbe/1.0" }
-    });
-    if (r.ok) {
-      const ct = (r.headers.get("content-type") || "").toLowerCase();
-      if (ct && !ct.includes("image") && !ct.includes("octet-stream")) {
-        // some CDNs omit type on HEAD — still allow
-      }
-      return true;
-    }
-    // Some hosts block HEAD → try ranged GET
-    const r2 = await fetchFn(url, {
       method: "GET",
-      headers: { Range: "bytes=0-1023", "User-Agent": "CodexHubImageProbe/1.0" },
-      signal: AbortSignal.timeout(timeoutMs),
-      redirect: "follow"
+      redirect: "follow",
+      headers: { Range: "bytes=0-4095", "User-Agent": BROWSER_UA, Accept: "image/*" },
+      signal: AbortSignal.timeout(timeoutMs)
     });
-    return r2.ok || r2.status === 206;
+    if (!(r.ok || r.status === 206)) return false;
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (!ct.startsWith("image/") || ct.includes("svg")) return false;
+    const len = Number(r.headers.get("content-length") || 0);
+    const range = r.headers.get("content-range") || "";
+    const total = Number((range.split("/")[1]) || len || 0);
+    if (total && total < 3000) return false; // tracking pixels / placeholders
+    try { r.body && r.body.cancel && r.body.cancel(); } catch (e) {}
+    return true;
   } catch (e) {
     return false;
   }
@@ -103,7 +100,9 @@ export async function tavilyWebSearchLines(query, opts = {}) {
       max_results: opts.max || 8,
       include_answer: true,
       include_images: false,
-      topic: opts.topic || "general"
+      topic: opts.topic || (/\b(news|today|latest|this week|yesterday|breaking|current events|headlines)\b/i.test(String(query)) ? "news" : "general"),
+      ...(/\b(news|today|latest|this week|yesterday|breaking)\b/i.test(String(query)) ? { days: 7 } : {}),
+      include_raw_content: false
     });
     if (data.answer) lines.push("Direct: " + String(data.answer).slice(0, 600));
     for (const item of data.results || []) {
@@ -112,7 +111,7 @@ export async function tavilyWebSearchLines(query, opts = {}) {
       const link = item.url || "";
       if (title) {
         lines.push(
-          "• " + title + (snip ? " — " + snip.slice(0, 220) : "") + (link ? " [" + link + "]" : "")
+          "• " + title + (snip ? " — " + snip.replace(/\s+/g, " ").slice(0, 420) : "") + (link ? " (source: " + link + ")" : "")
         );
       }
     }
@@ -138,14 +137,14 @@ export async function tavilyImageSearch(query, limit = 6) {
     }
     const data = await tavilyRequest({
       query: q,
-      search_depth: "basic",
-      max_results: Math.min(10, Math.max(5, limit)),
+      max_results: Math.min(10, Math.max(6, limit + 2)),
+      search_depth: "advanced",
       include_images: true,
       include_image_descriptions: true
     });
 
     const pushImg = (url, title, link) => {
-      if (!url || out.length >= limit) return;
+      if (!url || out.length >= limit * 3) return;
       if (out.some((x) => (x.full || x.url) === url)) return;
       out.push({
         url,
@@ -172,16 +171,11 @@ export async function tavilyImageSearch(query, limit = 6) {
       }
     }
 
-    // Probe filter
-    const live = [];
-    for (const im of out) {
-      if (live.length >= limit) break;
-      const ok = await probeImageUrl(im.full || im.url);
-      if (ok) live.push(im);
-      else console.log("Tavily image dead:", (im.full || "").slice(0, 80));
-    }
+    // Probe ALL candidates in parallel; only return images that really load
+    const checks = await Promise.all(out.map((im) => probeImageUrl(im.full || im.url).then((ok) => (ok ? im : null))));
+    const live = checks.filter(Boolean).slice(0, limit);
     console.log("Tavily images HIT (live):", live.length, "raw:", out.length);
-    return live.length ? live : out.slice(0, limit); // if all probes fail (network), still return candidates
+    return live;
   } catch (e) {
     console.log("Tavily images error:", e.message || e);
     return out;

@@ -11,10 +11,13 @@ import {
   searchReferenceImagesWithTavily
 } from "./tavily-search.js";
 import { mountFcm } from "./fcm-routes.js";
+import { probeImageUrl } from "./tavily-search.js";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Paystack signs the RAW body — keep it raw for the webhook only
+app.use("/paystack/webhook", express.raw({ type: "*/*", limit: "1mb" }));
 app.use(express.json({ limit: "5mb" }));
 
 const ALLOWED_ORIGINS = [
@@ -1355,7 +1358,46 @@ async function searchReferenceImages(query, limit = 6) {
     } catch (e) {}
   }
 
-  return { query, provider, images };
+  // Final pass: drop anything that doesn't actually load as an image, then
+  // route through our /img-proxy so hotlink-protected sites still display.
+  const checked = await Promise.all(
+    images.map((im) =>
+      im.source === "tavily" ? Promise.resolve(im) : probeImageUrl(im.full || im.url).then((ok) => (ok ? im : null))
+    )
+  );
+  const base = (process.env.PUBLIC_BASE_URL || "https://codex-backend-new.onrender.com").replace(/\/$/, "");
+  const finalImages = checked.filter(Boolean).slice(0, limit).map((im) => {
+    const src = im.full || im.url;
+    const prox = base + "/img-proxy?u=" + encodeURIComponent(src);
+    return { ...im, original: src, url: prox, full: prox };
+  });
+  if (!finalImages.length) provider = "none";
+  return { query, provider, images: finalImages };
+}
+
+/** Fetch a Pollinations image on the SERVER so the student never sees a broken icon */
+async function pollinationsDataUrl(prompt) {
+  const url = pollinationsUrl(prompt);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(45000), headers: { Accept: "image/*" } });
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      if (!r.ok || !ct.startsWith("image/")) { console.log("Pollinations bad", r.status, ct); continue; }
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length < 5000) continue;
+      return "data:" + ct.split(";")[0] + ";base64," + buf.toString("base64");
+    } catch (e) {
+      console.log("Pollinations fetch failed:", e.message);
+    }
+  }
+  return null;
+}
+
+function isPrivateHost(h) {
+  h = String(h || "").toLowerCase();
+  return h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") ||
+    /^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) ||
+    h === "[::1]" || h.startsWith("[fc") || h.startsWith("[fd") || h === "metadata.google.internal";
 }
 
 
@@ -1897,15 +1939,19 @@ app.post("/chat", async (req, res) => {
         console.log("HF image path failed:", e.message);
       }
 
-      // 3) Pollinations last fallback
-      const url = pollinationsUrl(prompt);
+      // 3) Pollinations last fallback — fetched server-side and verified
       console.log("Image gen via Pollinations:", prompt.slice(0, 120));
+      const polData = await pollinationsDataUrl(prompt);
+      if (!polData) {
+        const busy = "I couldn't create that image right now — the image generators are busy. Please try again in a minute.";
+        return res.json({ choices: [{ message: { content: busy } }], reply: busy, image_url: null, tool: "none" });
+      }
       const content = "Here is the image I generated based on your request.";
       return res.json({
         choices: [{ message: { content } }],
         reply: content,
-        image_url: url,
-        image_mime_type: "image/jpeg",
+        image_url: polData,
+        image_mime_type: polData.split(";")[0].replace("data:", ""),
         prompt_used: fallbackPrompt,
         tool: "pollinations",
         image_profile: imageProfileForPrompt(fallbackPrompt)
@@ -2210,12 +2256,13 @@ app.post("/image-gen", async (req, res) => {
       console.log("image-gen HF failed:", e.message);
     }
 
-    // 3) Pollinations
-    const url = pollinationsUrl(prompt);
+    // 3) Pollinations (server-verified)
+    const polData = await pollinationsDataUrl(prompt);
+    if (!polData) return res.status(503).json({ ok: false, error: "image_gen_busy", message: "Image generators are busy. Try again shortly." });
     return res.json({
       ok: true,
-      image_url: url,
-      image_mime_type: "image/jpeg",
+      image_url: polData,
+      image_mime_type: polData.split(";")[0].replace("data:", ""),
       prompt_used: prompt,
       tool: "pollinations",
       image_profile: imageProfileForPrompt(prompt)
@@ -2223,6 +2270,34 @@ app.post("/image-gen", async (req, res) => {
   } catch (error) {
     console.error("image-gen", error);
     return res.status(500).json({ error: "image_gen_failed", message: error.message });
+  }
+});
+
+// Image proxy: lets Nova show search photos from sites that block hotlinking
+app.get("/img-proxy", async (req, res) => {
+  try {
+    const u = new URL(String(req.query.u || ""));
+    if (!/^https?:$/.test(u.protocol) || isPrivateHost(u.hostname)) return res.status(400).end();
+    const r = await fetch(u.toString(), {
+      redirect: "follow",
+      signal: AbortSignal.timeout(12000),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+        Referer: u.origin + "/"
+      }
+    });
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (!r.ok || !ct.startsWith("image/") || ct.includes("svg")) return res.status(404).end();
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > 8 * 1024 * 1024) return res.status(413).end();
+    res.set("Content-Type", ct);
+    res.set("Cache-Control", "public, max-age=604800, immutable");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Cross-Origin-Resource-Policy", "cross-origin");
+    return res.send(buf);
+  } catch (e) {
+    return res.status(404).end();
   }
 });
 

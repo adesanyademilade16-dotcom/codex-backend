@@ -60,45 +60,90 @@ async function grantPlan({ uid, plan, reference, amountKobo }) {
   if (!planConfig) throw new Error("Invalid plan");
   const db = getAdmin().firestore();
   const txRef = db.collection("hub_transactions").doc(reference);
-  const existing = await txRef.get();
-  if (existing.exists) {
-    return { already: true, expiresAt: existing.data()?.expiresAt || null, plan };
-  }
+  const userRef = db.collection("users").doc(uid);
+  const DAY = 24 * 60 * 60 * 1000;
 
-  const now = Date.now();
-  const expiresAt = now + planConfig.durationDays * 24 * 60 * 60 * 1000;
+  // Transaction = two parallel verify calls (or verify + webhook) can never
+  // both grant; and a reference can only ever be used once.
+  return db.runTransaction(async (t) => {
+    const existing = await t.get(txRef);
+    if (existing.exists) {
+      const ex = existing.data() || {};
+      if (ex.uid && ex.uid !== uid) {
+        const err = new Error("Reference already used by another account");
+        err.status = 409;
+        throw err;
+      }
+      return { already: true, expiresAt: ex.expiresAt || null, plan: ex.plan || plan };
+    }
+    const userSnap = await t.get(userRef);
+    const u = userSnap.exists ? userSnap.data() || {} : {};
+    const now = Date.now();
+    const curExp = Number(u.planExpiresAt) || 0;
+    const curPlan = String(u.plan || u.subscriptionTier || "free").toLowerCase();
+    const stillActive = curExp > now;
 
-  const batch = db.batch();
-  batch.set(txRef, {
-    uid,
-    plan,
-    app: "codex-hub",
-    amountNaira: planConfig.amountNaira,
-    amountKobo: amountKobo || planConfig.amountNaira * 100,
-    reference,
-    status: "success",
-    expiresAt,
-    createdAt: now
-  });
-  batch.set(
-    db.collection("users").doc(uid),
-    {
+    // Never downgrade an active Pro by buying Regular; extend instead.
+    let finalPlan = plan;
+    if (stillActive && curPlan === "pro" && plan === "regular") finalPlan = "pro";
+    // Same plan renewed early → stack remaining days on top.
+    const base = stillActive && curPlan === finalPlan ? curExp : now;
+    const expiresAt = base + planConfig.durationDays * DAY;
+
+    t.set(txRef, {
+      uid,
       plan,
-      subscriptionTier: plan,
-      isPro: plan === "pro",
-      isRegular: plan === "regular",
-      planExpiresAt: expiresAt,
-      subscriptionExpires: expiresAt,
-      proUntil: plan === "pro" ? expiresAt : null,
-      regularUntil: plan === "regular" ? expiresAt : null,
-      lastPaymentRef: reference,
-      lastPaymentAt: now,
-      updatedAt: now
-    },
-    { merge: true }
-  );
-  await batch.commit();
-  return { already: false, expiresAt, plan };
+      grantedPlan: finalPlan,
+      app: "codex-hub",
+      amountNaira: planConfig.amountNaira,
+      amountKobo: amountKobo || planConfig.amountNaira * 100,
+      reference,
+      status: "success",
+      expiresAt,
+      createdAt: now
+    });
+    t.set(
+      userRef,
+      {
+        plan: finalPlan,
+        subscriptionTier: finalPlan,
+        isPro: finalPlan === "pro",
+        isRegular: finalPlan === "regular",
+        planExpiresAt: expiresAt,
+        subscriptionExpires: expiresAt,
+        proUntil: finalPlan === "pro" ? expiresAt : null,
+        regularUntil: finalPlan === "regular" ? expiresAt : null,
+        lastPaymentRef: reference,
+        lastPaymentAt: now,
+        updatedAt: now
+      },
+      { merge: true }
+    );
+    return { already: false, expiresAt, plan: finalPlan };
+  });
+}
+
+/** Strict checks shared by /verify and /webhook. Returns {uid, plan} or throws. */
+function validateHubPayment(data, expectUid) {
+  const fail = (msg, status = 400) => { const e = new Error(msg); e.status = status; throw e; };
+  if (!data || data.status !== "success") fail("Payment not successful yet");
+  const reference = String(data.reference || "");
+  // Same Paystack business as Prep → only CHUB_ references count for Hub.
+  if (!reference.startsWith("CHUB_")) fail("Not a Codex Hub payment");
+  const meta = data.metadata || {};
+  if (meta.app !== "codex-hub") fail("Not a Codex Hub payment");
+  if (String(data.currency || "NGN").toUpperCase() !== "NGN") fail("Wrong currency");
+  const plan = String(meta.plan || "").toLowerCase();
+  const planConfig = PLANS[plan];
+  if (!planConfig) fail("Unknown plan in payment");
+  // Plan inside reference must match metadata (stops editing metadata after init)
+  if (!reference.startsWith("CHUB_" + plan.toUpperCase() + "_")) fail("Plan mismatch");
+  if (Number(data.amount) < planConfig.amountNaira * 100) fail("Amount too low");
+  const uid = String(meta.uid || "");
+  if (!uid) fail("Payment has no account attached");
+  if (!reference.includes("_" + uid.slice(0, 8) + "_")) fail("Reference/account mismatch", 403);
+  if (expectUid && uid !== expectUid) fail("Reference does not belong to this account", 403);
+  return { uid, plan };
 }
 
 export function mountPaystack(app) {
@@ -126,7 +171,7 @@ export function mountPaystack(app) {
 
       const amountKobo = planConfig.amountNaira * 100;
       const reference =
-        "CHUB_" + plan.toUpperCase() + "_" + decoded.uid.slice(0, 8) + "_" + Date.now();
+        "CHUB_" + plan.toUpperCase() + "_" + decoded.uid.slice(0, 8) + "_" + Date.now() + crypto.randomBytes(3).toString("hex");
 
       const payRes = await fetch("https://api.paystack.co/transaction/initialize", {
         method: "POST",
@@ -179,32 +224,18 @@ export function mountPaystack(app) {
         { headers: { Authorization: "Bearer " + SECRET } }
       );
       const verifyData = await verifyRes.json();
-      if (!verifyRes.ok || !verifyData.status || verifyData.data.status !== "success") {
+      if (!verifyRes.ok || !verifyData.status || !verifyData.data || verifyData.data.status !== "success") {
         return res.status(400).json({ error: "Payment not successful yet" });
       }
 
-      const meta = verifyData.data.metadata || {};
-      const plan = String(meta.plan || "").toLowerCase();
-      const uid = meta.uid || decoded.uid;
-      if (uid !== decoded.uid && String(decoded.email || "").toLowerCase() !== "codexhub16@gmail.com") {
-        return res.status(403).json({ error: "Reference does not belong to this account" });
-      }
-      const planConfig = PLANS[plan];
-      if (!planConfig) return res.status(400).json({ error: "Unknown plan in payment" });
-      if (verifyData.data.amount < planConfig.amountNaira * 100) {
-        return res.status(400).json({ error: "Amount too low" });
-      }
-      if (meta.app && meta.app !== "codex-hub") {
-        return res.status(400).json({ error: "Not a Codex Hub payment" });
-      }
-
+      const { uid, plan } = validateHubPayment(verifyData.data, decoded.uid);
       const result = await grantPlan({
-        uid: decoded.uid,
+        uid,
         plan,
-        reference,
+        reference: verifyData.data.reference,
         amountKobo: verifyData.data.amount
       });
-      return res.json({ ok: true, plan, expiresAt: result.expiresAt, already: result.already });
+      return res.json({ ok: true, plan: result.plan, expiresAt: result.expiresAt, already: result.already });
     } catch (e) {
       console.error("paystack verify", e.message || e);
       return res.status(e.status || 500).json({ error: e.message || "Verify failed" });
@@ -248,25 +279,23 @@ export function mountPaystack(app) {
       }
       if (event.event !== "charge.success") return res.status(200).send("ignored");
 
-      const reference = event.data.reference;
+      const reference = String((event.data && event.data.reference) || "");
+      if (!reference.startsWith("CHUB_")) return res.status(200).send("not hub");
       const verifyRes = await fetch(
         "https://api.paystack.co/transaction/verify/" + encodeURIComponent(reference),
         { headers: { Authorization: "Bearer " + SECRET } }
       );
       const verifyData = await verifyRes.json();
-      if (!verifyRes.ok || verifyData.data.status !== "success") {
+      if (!verifyRes.ok || !verifyData.data || verifyData.data.status !== "success") {
         return res.status(200).send("not verified");
       }
 
-      const meta = verifyData.data.metadata || {};
-      if (meta.app && meta.app !== "codex-hub") return res.status(200).send("not hub");
-      const plan = String(meta.plan || "").toLowerCase();
-      const uid = meta.uid;
-      if (!uid || !PLANS[plan]) return res.status(200).send("bad meta");
-      if (verifyData.data.amount < PLANS[plan].amountNaira * 100) {
-        return res.status(200).send("low amount");
+      let uid, plan;
+      try {
+        ({ uid, plan } = validateHubPayment(verifyData.data, null));
+      } catch (vErr) {
+        return res.status(200).send("ignored: " + vErr.message);
       }
-
       await grantPlan({ uid, plan, reference, amountKobo: verifyData.data.amount });
       return res.status(200).send("ok");
     } catch (e) {
