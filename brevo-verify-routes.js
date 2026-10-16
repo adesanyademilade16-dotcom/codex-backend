@@ -16,6 +16,14 @@ const CODE_TTL_MS = 3 * 60 * 1000;
 const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_SENDS_PER_HOUR = 5;
 
+// The frontend's firebase-config.js — every ID token verifyIdToken() is ever
+// asked to check will have been issued FOR this project. A service account
+// from a different Firebase project fails every single call with
+// auth/argument-error, which is exactly what cost us a long debugging
+// session last time — this check turns that into an obvious log line
+// instead of a silent mismatch.
+const EXPECTED_PROJECT_ID = "codex-study-hub-923c5";
+
 function getAdmin() {
   if (admin.apps.length) return admin;
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
@@ -30,6 +38,15 @@ function getAdmin() {
   }
   if (cred.private_key && typeof cred.private_key === "string") {
     cred.private_key = cred.private_key.replace(/\\n/g, "\n");
+  }
+  if (cred.project_id && cred.project_id !== EXPECTED_PROJECT_ID) {
+    console.error(
+      "🚨 FIREBASE_SERVICE_ACCOUNT is for project \"" + cred.project_id + "\" but the " +
+      "Codex Hub frontend issues tokens for \"" + EXPECTED_PROJECT_ID + "\". Every verify/reset " +
+      "call will fail until this is corrected on Render."
+    );
+  } else if (cred.project_id) {
+    console.log("✅ Brevo routes: FIREBASE_SERVICE_ACCOUNT matches project", cred.project_id);
   }
   admin.initializeApp({ credential: admin.credential.cert(cred) });
   return admin;
@@ -49,7 +66,10 @@ async function verifyIdToken(req) {
   try {
     return await a.auth().verifyIdToken(token);
   } catch (e) {
-    console.error("verifyIdToken failed:", e.code || e.message);
+    // Log BOTH — e.code alone ("auth/argument-error") hides the actually
+    // useful part, which is in e.message (e.g. the exact "aud" project
+    // mismatch, or "Firebase ID token has expired").
+    console.error("verifyIdToken failed:", e.code || "(no code)", "—", e.message || e);
     const err = new Error("Session expired or invalid. Log in again, then Resend code.");
     err.status = 401;
     throw err;
@@ -124,12 +144,30 @@ async function rateLimitDoc(ref) {
 }
 
 export function mountBrevoVerify(app) {
+  // Visit this URL directly in a browser to self-diagnose. projectIdMatch is
+  // the one that matters most — if that's false, every send/check/reset call
+  // fails with auth/argument-error regardless of anything else being right.
   app.get("/auth/brevo-status", (req, res) => {
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+    let serviceAccountProjectId = null;
+    let serviceAccountJsonValid = null;
+    if (raw) {
+      try {
+        serviceAccountProjectId = JSON.parse(raw).project_id || null;
+        serviceAccountJsonValid = true;
+      } catch (e) {
+        serviceAccountJsonValid = false;
+      }
+    }
     res.json({
       ok: true,
       brevoKey: Boolean(process.env.BREVO_API_KEY),
       sender: Boolean(process.env.BREVO_SENDER_EMAIL),
-      firebaseAdmin: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON)
+      firebaseAdmin: Boolean(raw),
+      serviceAccountJsonValid,
+      serviceAccountProjectId,
+      expectedProjectId: EXPECTED_PROJECT_ID,
+      projectIdMatch: serviceAccountProjectId ? serviceAccountProjectId === EXPECTED_PROJECT_ID : null
     });
   });
 
