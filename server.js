@@ -11,6 +11,7 @@ import {
   searchReferenceImagesWithTavily
 } from "./tavily-search.js";
 import { mountFcm } from "./fcm-routes.js";
+import { mountReminders } from "./reminders-routes.js";
 import { probeImageUrl } from "./tavily-search.js";
 
 const app = express();
@@ -1394,10 +1395,70 @@ async function pollinationsDataUrl(prompt) {
 }
 
 function isPrivateHost(h) {
-  h = String(h || "").toLowerCase();
-  return h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") ||
-    /^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) ||
-    h === "[::1]" || h.startsWith("[fc") || h.startsWith("[fd") || h === "metadata.google.internal";
+  h = String(h || "").toLowerCase().replace(/\.+$/, "");
+  if (!h) return true;
+  // Block cloud metadata + common SSRF targets
+  if (
+    h === "localhost" ||
+    h === "metadata" ||
+    h === "metadata.google.internal" ||
+    h === "metadata.google.com" ||
+    h.endsWith(".local") ||
+    h.endsWith(".internal") ||
+    h.endsWith(".localhost") ||
+    h === "0.0.0.0" ||
+    h === "[::1]" ||
+    h.startsWith("[fc") ||
+    h.startsWith("[fd") ||
+    h.startsWith("[fe80")
+  ) {
+    return true;
+  }
+  // Private / link-local / loopback IPv4 (including decimal tricks like 2130706433 are blocked as non-hostname below)
+  if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.|100\.64\.|100\.127\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) {
+    return true;
+  }
+  // Bare IPv6 loopback/private
+  if (h === "::1" || h === "::") return true;
+  // Reject pure numeric hosts that can be decimal IP tricks
+  if (/^\d+$/.test(h)) return true;
+  return false;
+}
+
+/** Fetch image with redirect cap + re-check host each hop (SSRF harden). */
+async function safeImageFetch(startUrl, maxRedirects = 2) {
+  let url = new URL(String(startUrl));
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (!/^https?:$/.test(url.protocol) || isPrivateHost(url.hostname)) {
+      const err = new Error("blocked host");
+      err.status = 400;
+      throw err;
+    }
+    const r = await fetch(url.toString(), {
+      redirect: "manual",
+      signal: AbortSignal.timeout(12000),
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
+        Referer: url.origin + "/"
+      }
+    });
+    if ([301, 302, 303, 307, 308].includes(r.status)) {
+      const loc = r.headers.get("location");
+      if (!loc) {
+        const err = new Error("bad redirect");
+        err.status = 404;
+        throw err;
+      }
+      url = new URL(loc, url);
+      continue;
+    }
+    return r;
+  }
+  const err = new Error("too many redirects");
+  err.status = 400;
+  throw err;
 }
 
 
@@ -1774,16 +1835,22 @@ async function enforceNovaQuota(req, res) {
   const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : (req.body && req.body.idToken) || "";
   const cost = Math.min(4, Math.max(1, Number((req.body && req.body.quotaCost) || 1)));
 
-  // If no token, allow but mark soft (legacy clients) — prefer hard reject in production
+  // Hard require auth — unauthenticated Nova calls are rejected (closes quota bypass)
   if (!idToken) {
-    console.log("quota: no id token — soft allow");
-    return { ok: true, soft: true, cost };
+    return {
+      ok: false,
+      status: 401,
+      body: { error: "auth_required", message: "Sign in to use Nova." }
+    };
   }
 
   const identity = await verifyFirebaseIdToken(idToken);
   if (!identity || !identity.uid) {
-    console.log("quota: invalid token");
-    return { ok: true, soft: true, cost }; // don't lock out if verify fails
+    return {
+      ok: false,
+      status: 401,
+      body: { error: "auth_invalid", message: "Session expired. Sign in again." }
+    };
   }
 
   const userDoc = await firestoreGetUser(identity.uid, idToken);
@@ -2213,6 +2280,15 @@ app.post("/chat", async (req, res) => {
 // ─────────────────────────────
 app.post("/image-gen", async (req, res) => {
   try {
+    // Require signed-in user (same quota gate as /chat)
+    try {
+      const quotaResult = await enforceNovaQuota(req, res);
+      if (quotaResult && quotaResult.ok === false) {
+        return res.status(quotaResult.status || 401).json(quotaResult.body);
+      }
+    } catch (qe) {
+      console.log("image-gen quota", qe.message);
+    }
     const promptRaw = String(req.body?.prompt || req.body?.q || req.body?.text || "").trim();
     if (!promptRaw || promptRaw.length < 2) {
       return res.status(400).json({ error: "prompt required" });
@@ -2274,30 +2350,25 @@ app.post("/image-gen", async (req, res) => {
 });
 
 // Image proxy: lets Nova show search photos from sites that block hotlinking
+// SSRF-hardened: private hosts blocked, redirects re-checked, size/type capped
 app.get("/img-proxy", async (req, res) => {
   try {
-    const u = new URL(String(req.query.u || ""));
-    if (!/^https?:$/.test(u.protocol) || isPrivateHost(u.hostname)) return res.status(400).end();
-    const r = await fetch(u.toString(), {
-      redirect: "follow",
-      signal: AbortSignal.timeout(12000),
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
-        Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
-        Referer: u.origin + "/"
-      }
-    });
+    const raw = String(req.query.u || "").trim();
+    if (!raw || raw.length > 2048) return res.status(400).end();
+    const r = await safeImageFetch(raw, 2);
     const ct = (r.headers.get("content-type") || "").toLowerCase();
-    if (!r.ok || !ct.startsWith("image/") || ct.includes("svg")) return res.status(404).end();
+    if (!r.ok || !ct.startsWith("image/") || ct.includes("svg") || ct.includes("xml")) {
+      return res.status(404).end();
+    }
     const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > 8 * 1024 * 1024) return res.status(413).end();
-    res.set("Content-Type", ct);
+    if (buf.length > 5 * 1024 * 1024) return res.status(413).end();
+    res.set("Content-Type", ct.split(";")[0]);
     res.set("Cache-Control", "public, max-age=604800, immutable");
     res.set("Access-Control-Allow-Origin", "*");
     res.set("Cross-Origin-Resource-Policy", "cross-origin");
     return res.send(buf);
   } catch (e) {
-    return res.status(404).end();
+    return res.status(e.status || 404).end();
   }
 });
 
@@ -2348,6 +2419,106 @@ try {
 } catch (e) {
   console.error("FCM mount failed:", e.message || e);
 }
+
+try {
+  mountReminders(app);
+} catch (e) {
+  console.error("Reminders mount failed:", e.message || e);
+}
+
+/**
+ * Phase 7 — three free PDF download credits for genuinely new students.
+ * Server-side only; cannot be claimed twice. Uses Admin SDK.
+ * POST /credits/claim-welcome  Authorization: Bearer <Firebase ID token>
+ * GET  /credits/status
+ */
+app.get("/credits/status", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    if (!idToken) return res.status(401).json({ ok: false, error: "auth_required" });
+    const identity = await verifyFirebaseIdToken(idToken);
+    if (!identity || !identity.uid) return res.status(401).json({ ok: false, error: "auth_invalid" });
+
+    let adminSdk;
+    try {
+      adminSdk = (await import("firebase-admin")).default;
+      if (!adminSdk.apps.length) {
+        const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+        let cred = typeof raw === "object" ? raw : JSON.parse(raw);
+        if (cred.private_key) cred.private_key = String(cred.private_key).replace(/\\n/g, "\n");
+        adminSdk.initializeApp({ credential: adminSdk.credential.cert(cred) });
+      }
+    } catch (e) {
+      return res.status(503).json({ ok: false, error: "admin_unavailable" });
+    }
+    const snap = await adminSdk.firestore().collection("users").doc(identity.uid).get();
+    const d = snap.exists ? snap.data() || {} : {};
+    return res.json({
+      ok: true,
+      downloadCredits: Number(d.downloadCredits) || 0,
+      welcomeCreditsGranted: d.welcomeCreditsGranted === true
+    });
+  } catch (e) {
+    console.error("credits/status", e.message || e);
+    return res.status(500).json({ ok: false, error: "status_failed" });
+  }
+});
+
+app.post("/credits/claim-welcome", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    if (!idToken) return res.status(401).json({ ok: false, error: "auth_required" });
+    const identity = await verifyFirebaseIdToken(idToken);
+    if (!identity || !identity.uid) return res.status(401).json({ ok: false, error: "auth_invalid" });
+
+    let adminSdk;
+    try {
+      adminSdk = (await import("firebase-admin")).default;
+      if (!adminSdk.apps.length) {
+        const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+        let cred = typeof raw === "object" ? raw : JSON.parse(raw);
+        if (cred.private_key) cred.private_key = String(cred.private_key).replace(/\\n/g, "\n");
+        adminSdk.initializeApp({ credential: adminSdk.credential.cert(cred) });
+      }
+    } catch (e) {
+      return res.status(503).json({ ok: false, error: "admin_unavailable" });
+    }
+
+    const ref = adminSdk.firestore().collection("users").doc(identity.uid);
+    const result = await adminSdk.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const d = snap.exists ? snap.data() || {} : {};
+      if (d.welcomeCreditsGranted === true) {
+        return {
+          ok: true,
+          alreadyGranted: true,
+          downloadCredits: Number(d.downloadCredits) || 0
+        };
+      }
+      const current = Number(d.downloadCredits) || 0;
+      // Grant exactly 3 on first claim; never reduce an existing higher balance
+      const next = Math.max(current, 3);
+      tx.set(
+        ref,
+        {
+          downloadCredits: next,
+          welcomeCreditsGranted: true,
+          welcomeCreditsAt: adminSdk.firestore.FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+      return { ok: true, alreadyGranted: false, downloadCredits: next, granted: 3 };
+    });
+    return res.json(result);
+  } catch (e) {
+    console.error("credits/claim-welcome", e.message || e);
+    return res.status(500).json({ ok: false, error: "claim_failed" });
+  }
+});
+
+console.log("📌 Credits routes: /credits/claim-welcome, /credits/status");
 
 
 // Explicit image search for tools (diagram maker, Nova carousel)

@@ -1,9 +1,9 @@
 /**
  * Codex Hub — Paystack (server-side)
- * Same Paystack business as Prep; Hub-only metadata/refs (CHUB_ / app:codex-hub)
+ * Dedicated Codex Hub Prime Paystack business; Hub-only metadata/refs (CHUB_ / app:codex-hub)
  *
  * Env on Render (Hub service):
- *   PAYSTACK_SECRET_KEY
+ *   HUB_PAYSTACK_SECRET_KEY
  *   HUB_FRONTEND_URL=https://codex-hub-prime.vercel.app
  *   FIREBASE_SERVICE_ACCOUNT (already used by Brevo)
  *
@@ -147,7 +147,7 @@ function validateHubPayment(data, expectUid) {
 }
 
 export function mountPaystack(app) {
-  const SECRET = process.env.PAYSTACK_SECRET_KEY || "";
+  const SECRET = process.env.HUB_PAYSTACK_SECRET_KEY || "";
   const FRONTEND = (process.env.HUB_FRONTEND_URL || "https://codex-hub-prime.vercel.app").replace(/\/$/, "");
 
   app.get("/paystack/status", (req, res) => {
@@ -161,7 +161,7 @@ export function mountPaystack(app) {
 
   app.post("/paystack/initialize", async (req, res) => {
     try {
-      if (!SECRET) return res.status(500).json({ error: "PAYSTACK_SECRET_KEY not set on server" });
+      if (!SECRET) return res.status(500).json({ error: "HUB_PAYSTACK_SECRET_KEY not set on server" });
       const decoded = await verifyBearer(req);
       const plan = String((req.body && req.body.plan) || "").toLowerCase();
       const planConfig = PLANS[plan];
@@ -214,7 +214,7 @@ export function mountPaystack(app) {
 
   app.post("/paystack/verify", async (req, res) => {
     try {
-      if (!SECRET) return res.status(500).json({ error: "PAYSTACK_SECRET_KEY not set" });
+      if (!SECRET) return res.status(500).json({ error: "HUB_PAYSTACK_SECRET_KEY not set" });
       const decoded = await verifyBearer(req);
       const reference = String((req.body && req.body.reference) || "").trim();
       if (!reference) return res.status(400).json({ error: "Missing reference" });
