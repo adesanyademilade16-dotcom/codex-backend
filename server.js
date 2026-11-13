@@ -47,6 +47,14 @@ function isAllowedOrigin(origin) {
   return false;
 }
 
+// Diagnostic only: record WHERE "Origin: null" requests come from (never allowed).
+app.use((req, res, next) => {
+  if (req.headers.origin === "null") {
+    console.log("Origin null request:", req.method, req.path, "UA:", String(req.headers["user-agent"] || "").slice(0, 120));
+  }
+  next();
+});
+
 app.use(cors({
   origin: (origin, callback) => {
     if (isAllowedOrigin(origin)) return callback(null, true);
@@ -1736,13 +1744,55 @@ function normTierQ(tier) {
   return "free";
 }
 
+// Firebase Admin Auth (lazy). Uses the same FIREBASE_SERVICE_ACCOUNT as /credits and the other routes.
+let _adminAuthPromise = null;
+function getAdminAuth() {
+  if (_adminAuthPromise) return _adminAuthPromise;
+  _adminAuthPromise = (async () => {
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+    if (!raw) return null;
+    const adminSdk = (await import("firebase-admin")).default;
+    if (!adminSdk.apps.length) {
+      const cred = typeof raw === "object" ? raw : JSON.parse(raw);
+      if (cred.private_key) cred.private_key = String(cred.private_key).replace(/\\n/g, "\n");
+      adminSdk.initializeApp({ credential: adminSdk.credential.cert(cred) });
+    }
+    return adminSdk.auth();
+  })().catch((e) => {
+    console.log("firebase admin auth unavailable:", e.message);
+    return null;
+  });
+  return _adminAuthPromise;
+}
+
 async function verifyFirebaseIdToken(idToken) {
   if (!idToken) return null;
+
+  // 1) Preferred: Admin SDK verifies signature, expiry, issuer AND audience (our Firebase project).
   try {
-    // Verify via Google tokeninfo (works for Firebase ID tokens)
+    const adminAuth = await getAdminAuth();
+    if (adminAuth) {
+      try {
+        const decoded = await adminAuth.verifyIdToken(idToken);
+        return { uid: decoded.uid, email: decoded.email };
+      } catch (e) {
+        const code = String((e && e.code) || "");
+        // A definite rejection of the token: do NOT fall back to weaker checks.
+        if (code.startsWith("auth/") && code !== "auth/internal-error") {
+          console.log("token rejected by Firebase Admin:", code);
+          return null;
+        }
+        console.log("firebase admin verify error (falling back):", code || (e && e.message));
+      }
+    }
+  } catch (e) {
+    console.log("firebase admin path failed (falling back):", e.message);
+  }
+
+  // 2) Legacy fallback (unchanged behaviour), now with reasons logged. Tokens/keys are never logged.
+  try {
     const r = await fetch("https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(idToken));
     if (!r.ok) {
-      // Fallback: accounts:lookup needs API key
       if (FIREBASE_API_KEY) {
         const r2 = await fetch(
           "https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" + FIREBASE_API_KEY,
@@ -1752,11 +1802,15 @@ async function verifyFirebaseIdToken(idToken) {
             body: JSON.stringify({ idToken })
           }
         );
-        if (!r2.ok) return null;
+        if (!r2.ok) {
+          console.log("token verify failed: tokeninfo", r.status, "accounts:lookup", r2.status);
+          return null;
+        }
         const data = await r2.json();
         const u = data.users && data.users[0];
         return u ? { uid: u.localId, email: u.email } : null;
       }
+      console.log("token verify failed: tokeninfo", r.status, "and no FIREBASE_API_KEY / admin credentials configured");
       return null;
     }
     const data = await r.json();
