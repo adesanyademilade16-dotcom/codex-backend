@@ -89,6 +89,43 @@ function dayKey(ms) {
   return d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1) + "-" + pad(d.getUTCDate());
 }
 
+/**
+ * Persist an in-app notification for a due reminder so it shows in the notification centre
+ * even when push is denied / no FCM token / delivery fails. Idempotent: the document id is
+ * derived from (reminderId, dueKey) and create() refuses to overwrite, so retries or repeated
+ * cron runs cannot duplicate it. `delivery` records what actually happened:
+ *   "push_sent" | "push_failed" | "not_pushed" (no token / push disabled).
+ * Best-effort: never throws, never blocks the push path.
+ */
+async function recordReminderNotification(adm, db, uid, reminderId, r, dueKey, delivery, pushSuccess, openUrl) {
+  try {
+    const titles = { study: "Study session", revision: "Revision session", deadline: "Assignment deadline", task: "Task reminder" };
+    const custom = String(r.title || r.label || "").trim().slice(0, 80);
+    const label = custom || titles[r.type] || "Reminder";
+    const isPlan = r.source === "study_plan" || r.type === "task";
+    await db.collection("notifications").doc(uid).collection("items")
+      .doc("reminder_" + reminderId + "_" + dueKey)
+      .create({
+        type: isPlan ? "study_plan" : "reminder",
+        category: "study",
+        title: label,
+        message: custom
+          ? "Time for: " + custom + (r.time ? " · " + r.time : "")
+          : "It's " + (r.time || "time") + " — " + label.toLowerCase() + ".",
+        reminderId: reminderId,
+        dueKey: dueKey,
+        destination: openUrl,
+        delivery: delivery,
+        pushSuccess: Number(pushSuccess) || 0,
+        createdAt: adm.firestore.FieldValue.serverTimestamp(),
+        read: false
+      });
+  } catch (e) {
+    const code = e && (e.code === 6 || e.code === "already-exists" || /ALREADY_EXISTS/.test(String(e.message)));
+    if (!code) console.warn("[reminders/run] in-app notification failed:", e && e.message ? e.message : e);
+  }
+}
+
 async function runDueReminders() {
   const adm = getAdmin();
   const db = adm.firestore();
@@ -128,6 +165,8 @@ async function runDueReminders() {
     const nextMs = nextAfter(now, r.time, r.days, offset);
 
     if (!tokens.length || user.pushEnabled === false) {
+      await recordReminderNotification(adm, db, uid, doc.id, r, dueKey, "not_pushed", 0,
+        r.source === "study_plan" || r.type === "task" ? "/todo" : "/settings");
       await doc.ref.set(
         {
           lastFiredKey: dueKey,
@@ -181,6 +220,7 @@ async function runDueReminders() {
       });
     } catch (e) {
       console.error("[reminders/run] send failed", e.message || e);
+      await recordReminderNotification(adm, db, uid, doc.id, r, dueKey, "push_failed", 0, openUrl);
       await doc.ref.set(
         {
           lastAttemptAt: adm.firestore.FieldValue.serverTimestamp(),
@@ -226,6 +266,9 @@ async function runDueReminders() {
       },
       { merge: true }
     );
+
+    await recordReminderNotification(adm, db, uid, doc.id, r, dueKey,
+      result.successCount > 0 ? "push_sent" : "push_failed", result.successCount, openUrl);
 
     if (result.successCount > 0) report.sent++;
     else report.failed++;
