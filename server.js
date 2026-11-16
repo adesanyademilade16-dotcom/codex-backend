@@ -12,6 +12,7 @@ import {
 } from "./tavily-search.js";
 import { mountFcm } from "./fcm-routes.js";
 import { mountReminders } from "./reminders-routes.js";
+import { mountAdminBackfill } from "./admin-backfill-routes.js";
 import { probeImageUrl } from "./tavily-search.js";
 
 const app = express();
@@ -2476,6 +2477,7 @@ try {
 
 try {
   mountReminders(app);
+  mountAdminBackfill(app); // one-time admin tool — remove after use
 } catch (e) {
   console.error("Reminders mount failed:", e.message || e);
 }
