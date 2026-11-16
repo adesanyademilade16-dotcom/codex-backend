@@ -2,7 +2,7 @@
  * Admin-only, ONE-TIME tool: create missing public_profiles/{uid} documents so every student appears in Chats search.
  *   POST /admin/backfill-public-profiles   Authorization: Bearer <Firebase ID token>   body: { "apply": false|true }
  * Only the owner email or an active admins/{uid} account may call it. Dry run unless apply === true.
- * Never overwrites an existing public profile; copies ONLY public fields (no email/tokens/plan/credits/admin flags).
+ * Never overwrites an existing public profile; copies ONLY name, username, photo, university, faculty, department, level (NOT bio, email, tokens, plan, credits or admin flags).
  * Delete this file (and its 2 lines in server.js) once you've run it.
  */
 import admin from "firebase-admin";
@@ -29,7 +29,7 @@ export function buildPublic(u) {
     faculty: u.faculty || "",
     department: u.department || "",
     level: u.level == null ? "" : u.level,
-    bio: u.bio || "",
+    bio: "",                                   // never copied: bios may hold personal details
     avatarKey: u.avatarKey || "",
     updatedAt: admin.firestore.FieldValue.serverTimestamp()
   };
